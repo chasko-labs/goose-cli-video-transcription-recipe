@@ -1,0 +1,9 @@
+{
+  "name": "video-processing-pipeline",
+  "version": "1.0.0",
+  "dependencies": {
+    "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/sdk-node": "^0.45.0",
+    "@opentelemetry/exporter-jaeger": "^1.18.0"
+  }
+}
