@@ -1,0 +1,16 @@
+transcripts/
+output/
+temp/
+logs/
+*.log
+.DS_Store
+__pycache__/
+*.pyc
+node_modules/
+.env
+.env.local
+media/videos/*
+media/frames/*
+media/audio/*
+media/transcripts/*
+!media/**/.gitkeep
