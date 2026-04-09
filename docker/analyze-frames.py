@@ -6,15 +6,38 @@ Output: <output_dir>/<base_prefix>-frame-analysis.json
 
 Model: amd/Instella-VL-1B (VISION_MODEL env to override)
 Architecture: CLIP ViT-L/14@336 + AMD OLMo 1B SFT + 2-layer MLP projector
-Requires: transformers>=4.40,<4.45 (apply_chunking_to_forward removed in 4.45)
+
+Dependency conflict resolution:
+  tokenizer.json NFC normalizer requires tokenizers>=0.20 which requires transformers>=4.45.
+  But modeling_instellavl.py imports apply_chunking_to_forward removed in transformers 4.45.
+  Patch: re-inject the function into transformers.modeling_utils before model load.
 """
 import sys
 import os
 import json
 import glob
 import torch
+import transformers.modeling_utils as _tmu
 from pathlib import Path
 from PIL import Image
+
+# patch apply_chunking_to_forward removed in transformers 4.45
+# re-implemented from prior transformers source (apache 2.0)
+if not hasattr(_tmu, 'apply_chunking_to_forward'):
+    def _apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
+        if chunk_size > 0:
+            tensor_shape = input_tensors[0].shape[chunk_dim]
+            assert all(t.shape[chunk_dim] == tensor_shape for t in input_tensors)
+            if tensor_shape % chunk_size != 0:
+                raise ValueError(
+                    f"Dimension to chunk ({tensor_shape}) must be a multiple of chunk_size ({chunk_size})"
+                )
+            num_chunks = tensor_shape // chunk_size
+            chunks = tuple(t.chunk(num_chunks, dim=chunk_dim) for t in input_tensors)
+            output_chunks = tuple(forward_fn(*grp) for grp in zip(*chunks))
+            return torch.cat(output_chunks, dim=chunk_dim)
+        return forward_fn(*input_tensors)
+    _tmu.apply_chunking_to_forward = _apply_chunking_to_forward
 
 PROMPT = (
     "Describe all UI elements, text, menus, buttons, and visual content visible in this frame. "

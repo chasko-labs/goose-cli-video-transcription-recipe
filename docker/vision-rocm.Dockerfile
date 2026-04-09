@@ -3,12 +3,11 @@ FROM rocm/pytorch:latest
 WORKDIR /app
 
 # transformers + vision deps — no model pre-download; HF cache is a volume mount
-# transformers pinned <4.45 — Instella-VL-1B custom code imports
-# apply_chunking_to_forward which was removed in 4.45
-# tokenizers pinned >=0.20 — NFC normalizer in tokenizer.json requires 0.20+
+# latest transformers + tokenizers: tokenizer.json NFC normalizer requires tokenizers>=0.20
+# which requires transformers>=4.45. apply_chunking_to_forward (removed in 4.45)
+# is patched back in analyze-frames.py before the model loads.
 RUN pip install --no-cache-dir \
-    "transformers>=4.40,<4.45" \
-    "tokenizers>=0.20" \
+    transformers \
     accelerate \
     einops \
     pillow \
