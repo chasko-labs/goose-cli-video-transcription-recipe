@@ -43,8 +43,20 @@ echo "[transcribe] extracting frames (scene threshold: $SCENE_THRESHOLD)"
 ffmpeg -i "$VIDEO_FILE" \
   -vf "select='gt(scene,${SCENE_THRESHOLD})',scale=1280:-2" \
   -vsync vfr \
-  "${FRAMES_DIR}/${BASE}_frame_%04d.png" 2>&1
+  "${FRAMES_DIR}/${BASE}_frame_%04d.png" 2>/dev/null
+
 FRAME_COUNT=$(ls "${FRAMES_DIR}/${BASE}_frame_"*.png 2>/dev/null | wc -l)
+
+# fallback: 1 frame every 10s if scene detection found nothing
+if [ "$FRAME_COUNT" -eq 0 ]; then
+  echo "[transcribe] scene detection yielded 0 frames — falling back to 1/10s interval"
+  ffmpeg -i "$VIDEO_FILE" \
+    -vf "fps=1/10,scale=1280:-2" \
+    -vsync vfr \
+    "${FRAMES_DIR}/${BASE}_frame_%04d.png" 2>/dev/null
+  FRAME_COUNT=$(ls "${FRAMES_DIR}/${BASE}_frame_"*.png 2>/dev/null | wc -l)
+fi
+
 echo "[transcribe] frames extracted: $FRAME_COUNT"
 
 # transcribe audio on GPU
