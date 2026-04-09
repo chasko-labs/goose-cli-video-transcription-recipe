@@ -6,6 +6,7 @@ WORKDIR /app
 RUN pip install --no-cache-dir \
     transformers>=4.40.0 \
     accelerate \
+    einops \
     pillow \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
