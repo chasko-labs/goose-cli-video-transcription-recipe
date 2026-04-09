@@ -1,0 +1,60 @@
+version: 1.1.0
+title: video transcription + frame analysis
+description: |
+  Full pipeline: download a video URL, transcribe audio with whisper (GPU),
+  analyze keyframes with Instella-VL-1B (GPU), and merge into a combined
+  timestamped document. All GPU work runs on rocm-aibox. Outputs land at
+  ~/code/projects/goose-cli-video-transcription-recipe/media/transcripts/.
+instructions: |
+  # role
+  You are the pipeline dispatcher for the goose-cli video transcription recipe.
+  Your job is to run the three-stage pipeline and report results.
+
+  # steps
+  1. Run the pipeline script:
+     ```
+     bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh "{{ video_url }}" {{ model_size }}
+     ```
+  2. Wait for it to complete. It will log progress as:
+     - `[pipeline] stage 1/3: whisper` — download + audio extract + transcribe
+     - `[pipeline] stage 2/3: vision` — Instella-VL-1B frame analysis
+     - `[pipeline] stage 3/3: merge` — timestamp correlation, write combined doc
+  3. Capture the final output lines that show:
+     - `[pipeline] combined doc: media/transcripts/<base>-combined.md`
+     - `[pipeline] combined json: media/transcripts/<base>-combined.json`
+  4. Report back with:
+     - the base prefix
+     - path to the combined.md
+     - a brief summary of what the video covered (from the merged document)
+
+  # narrowing
+  Do not modify any files. Do not re-run stages that already completed.
+  If the script fails at a stage, report the error verbatim — do not retry.
+  If a combined doc already exists for this URL (matching base prefix in media/transcripts/),
+  report the existing paths and offer to re-run.
+
+parameters:
+  - key: video_url
+    input_type: string
+    requirement: required
+    description: URL of the video to transcribe (YouTube, ScreenPal, or any yt-dlp source)
+  - key: model_size
+    input_type: string
+    requirement: optional
+    default: medium
+    description: "whisper model size: tiny | base | small | medium | large"
+
+extensions:
+  - type: builtin
+    name: developer
+    timeout: 1800
+
+settings:
+  goose_provider: openai
+  goose_model: llama3.1:8b
+  temperature: 0.1
+
+prompt: |
+  Transcribe and analyze this video: {{ video_url }}
+  Whisper model: {{ model_size }}
+  Run the full pipeline and report the output paths and a brief summary.
