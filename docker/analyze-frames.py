@@ -72,18 +72,21 @@ def load_model():
     ).to("cuda")
     model.eval()
     device = next(model.parameters()).device
+    # encode() needs the CLIPImageProcessor from the vision tower (has crop_size)
+    # not InstellaVLImageProcessor (processor.image_processor — no crop_size)
+    clip_processor = model.get_model().get_vision_tower().image_processor
     print(f"[vision] {MODEL_ID} loaded on {device}", flush=True)
-    return model, processor
+    return model, processor, clip_processor
 
 
-def analyze_frame(model, processor, image_path):
+def analyze_frame(model, processor, clip_processor, image_path):
     image = Image.open(image_path).convert("RGB")
 
     # InstellaVLProcessor.encode() handles conv template + image token insertion
     enc = processor.encode(
         text=PROMPT,
         images=image,
-        image_processor=processor.image_processor,
+        image_processor=clip_processor,
         tokenizer=processor.tokenizer,
         model_cfg=model.config,
     )
@@ -127,14 +130,14 @@ def main():
 
     print(f"[vision] {len(frames)} frames to analyze", flush=True)
 
-    model, processor = load_model()
+    model, processor, clip_processor = load_model()
 
     results = []
     for i, frame_path in enumerate(frames):
         frame_name = Path(frame_path).name
         frame_idx = int(frame_name.split("_frame_")[1].split(".")[0])
         print(f"[vision] {i+1}/{len(frames)}: {frame_name}", flush=True)
-        description = analyze_frame(model, processor, frame_path)
+        description = analyze_frame(model, processor, clip_processor, frame_path)
         results.append({
             "frame": frame_name,
             "frame_index": frame_idx,
