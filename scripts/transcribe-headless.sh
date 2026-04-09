@@ -37,12 +37,12 @@ FC_POOL_URL="${FC_POOL_URL:-http://localhost:8150}"
 JAEGER_OTLP="${JAEGER_OTLP:-http://rocm-aibox.local:4318}"
 TRACE_PY="$PROJECT_DIR/scripts/trace.py"
 
-# stage timeouts (seconds)
-TIMEOUT_STAGE0=600
-TIMEOUT_STAGE1=900
-TIMEOUT_STAGE2=600
-TIMEOUT_STAGE3=60
-TIMEOUT_STAGE4=180
+# stage timeouts (seconds, overridable via env)
+TIMEOUT_STAGE0="${TIMEOUT_STAGE0:-600}"
+TIMEOUT_STAGE1="${TIMEOUT_STAGE1:-900}"
+TIMEOUT_STAGE2="${TIMEOUT_STAGE2:-600}"
+TIMEOUT_STAGE3="${TIMEOUT_STAGE3:-60}"
+TIMEOUT_STAGE4="${TIMEOUT_STAGE4:-180}"
 
 STAGE_NAMES=("media-extract" "whisper" "vision" "merge" "narrative")
 
