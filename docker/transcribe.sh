@@ -22,7 +22,8 @@ BASE="$TIMESTAMP"
 
 # --- metadata: fetch before download so we have title/uploader for context ---
 echo "[transcribe] fetching metadata"
-yt-dlp --dump-json "$URL" > "${TRANSCRIPT_DIR}/metadata.json" 2>/dev/null \
+# 2>/dev/null: suppress warnings that would corrupt the JSON file
+yt-dlp --dump-json "$URL" 2>/dev/null | grep "^{" > "${TRANSCRIPT_DIR}/metadata.json" \
   || echo "[transcribe] warning: metadata fetch failed (non-fatal)"
 
 # download full video — needed for both audio and frame extraction
