@@ -3,14 +3,15 @@
 merge-outputs.py — correlate whisper transcript + Instella-VL frame analysis
 Usage: python3 merge-outputs.py <base_prefix> [media_root]
 
-  base_prefix — e.g. 20260409_024754_www_youtube_com_watch_v_wSCofxpLgZA
-  media_root  — directory containing audio/, frames/, transcripts/, videos/
-                defaults to ./media
+  base_prefix — timestamp-only, e.g. 20260409_035707
+  media_root  — per-video directory containing audio/, frames/, transcripts/, videos/
+                defaults to ~/video-transcripts/<inferred from cwd>
 
 Reads:
-  <media_root>/transcripts/<base_prefix>.json         (whisper output)
-  <media_root>/transcripts/<base_prefix>-frame-analysis.json  (vision output)
-  <media_root>/videos/<base_prefix>.mp4               (for duration via ffprobe)
+  <media_root>/transcripts/<base_prefix>.json                   (whisper)
+  <media_root>/transcripts/<base_prefix>-frame-analysis.json    (vision)
+  <media_root>/videos/<base_prefix>.mp4                         (duration via ffprobe)
+  <media_root>/transcripts/metadata.json                        (yt-dlp, optional)
 
 Writes (persistent, re-runnable):
   <media_root>/transcripts/<base_prefix>-combined.json
@@ -187,7 +188,8 @@ def main():
         sys.exit(1)
 
     base = sys.argv[1]
-    media_root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.home() / "video-transcripts"
+    # media_root is the per-video dir (contains transcripts/, videos/, etc.)
+  media_root = Path(sys.argv[2]).expanduser() if len(sys.argv) > 2 else Path("/media")
 
     data = build_combined(base, media_root)
 

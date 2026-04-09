@@ -1,7 +1,9 @@
 #!/bin/bash
-# transcribe.sh — pipeline entrypoint
+# transcribe.sh — pipeline entrypoint (runs inside whisper-rocm container)
 # usage: transcribe.sh <video-url> [model-size]
 # output: timestamped transcript + frames in /media/
+# note: /media/{videos,audio,frames,transcripts} are mounted from the host
+#       per-video slug subfolder is handled by the host (transcribe-headless.sh)
 set -uo pipefail
 
 URL="${1:?usage: transcribe.sh <video-url> [model-size]}"
@@ -14,9 +16,14 @@ TRANSCRIPT_DIR="/media/transcripts"
 VIDEO_DIR="/media/videos"
 mkdir -p "$AUDIO_DIR" "$FRAMES_DIR" "$TRANSCRIPT_DIR" "$VIDEO_DIR"
 
-SLUG=$(echo "$URL" | sed 's|https\?://||;s|[^a-zA-Z0-9]|_|g' | cut -c1-60)
+# BASE is timestamp only — slug is the host-side folder name
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
-BASE="${TIMESTAMP}_${SLUG}"
+BASE="$TIMESTAMP"
+
+# --- metadata: fetch before download so we have title/uploader for context ---
+echo "[transcribe] fetching metadata"
+yt-dlp --dump-json "$URL" > "${TRANSCRIPT_DIR}/metadata.json" 2>/dev/null \
+  || echo "[transcribe] warning: metadata fetch failed (non-fatal)"
 
 # download full video — needed for both audio and frame extraction
 echo "[transcribe] downloading video from $URL"
