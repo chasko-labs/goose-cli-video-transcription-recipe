@@ -189,7 +189,7 @@ def main():
 
     base = sys.argv[1]
     # media_root is the per-video dir (contains transcripts/, videos/, etc.)
-  media_root = Path(sys.argv[2]).expanduser() if len(sys.argv) > 2 else Path("/media")
+    media_root = Path(sys.argv[2]).expanduser() if len(sys.argv) > 2 else Path("/media")
 
     data = build_combined(base, media_root)
 
