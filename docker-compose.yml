@@ -11,10 +11,10 @@ services:
       - video
       - render
     volumes:
-      - ./media/videos:/media/videos
-      - ./media/audio:/media/audio
-      - ./media/frames:/media/frames
-      - ./media/transcripts:/media/transcripts
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/videos:/media/videos
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/audio:/media/audio
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/frames:/media/frames
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/transcripts:/media/transcripts
     environment:
       - HSA_OVERRIDE_GFX_VERSION=10.3.0
       - PYTORCH_ALLOC_CONF=expandable_segments:True
@@ -34,8 +34,8 @@ services:
       - video
       - render
     volumes:
-      - ./media/frames:/media/frames
-      - ./media/transcripts:/media/transcripts
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/frames:/media/frames
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/transcripts:/media/transcripts
       - hf-cache:/cache/huggingface
     environment:
       - HSA_OVERRIDE_GFX_VERSION=10.3.0

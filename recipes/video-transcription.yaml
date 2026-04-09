@@ -20,8 +20,8 @@ instructions: |
      - `[pipeline] stage 2/3: vision` — Instella-VL-1B frame analysis
      - `[pipeline] stage 3/3: merge` — timestamp correlation, write combined doc
   3. Capture the final output lines that show:
-     - `[pipeline] combined doc: media/transcripts/<base>-combined.md`
-     - `[pipeline] combined json: media/transcripts/<base>-combined.json`
+     - `[pipeline] combined doc:  ~/video-transcripts/transcripts/<base>-combined.md`
+     - `[pipeline] combined json: ~/video-transcripts/transcripts/<base>-combined.json`
   4. Report back with:
      - the base prefix
      - path to the combined.md

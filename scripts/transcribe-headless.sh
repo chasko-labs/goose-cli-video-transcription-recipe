@@ -7,10 +7,14 @@ set -uo pipefail
 URL="${1:?usage: transcribe-headless.sh <video-url> [model-size]}"
 MODEL="${2:-medium}"
 PROJECT_DIR="$HOME/code/projects/goose-cli-video-transcription-recipe"
+DATA_DIR="${VIDEO_TRANSCRIPTS_DIR:-$HOME/video-transcripts}"
 WHISPER_IMAGE="goose-cli-video-transcription-recipe-whisper:latest"
 VISION_IMAGE="goose-cli-video-transcription-recipe-vision:latest"
 
 cd "$PROJECT_DIR"
+
+# ensure data directories exist outside the repo
+mkdir -p "$DATA_DIR"/{videos,audio,frames,transcripts}
 
 # build images if missing
 if ! docker image inspect "$WHISPER_IMAGE" >/dev/null 2>&1; then
@@ -26,11 +30,12 @@ fi
 echo "[pipeline] stage 1/3: whisper (model=$MODEL)"
 WHISPER_OUT=$(docker run --rm \
   --device=/dev/kfd --device=/dev/dri \
-  --group-add video --group-add render \
-  -v ./media/videos:/media/videos \
-  -v ./media/audio:/media/audio \
-  -v ./media/frames:/media/frames \
-  -v ./media/transcripts:/media/transcripts \
+  --group-add video \
+  --group-add render \
+  -v "$DATA_DIR/videos:/media/videos" \
+  -v "$DATA_DIR/audio:/media/audio" \
+  -v "$DATA_DIR/frames:/media/frames" \
+  -v "$DATA_DIR/transcripts:/media/transcripts" \
   -e HSA_OVERRIDE_GFX_VERSION=10.3.0 \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
   -e SCENE_THRESHOLD=0.4 \
@@ -49,9 +54,10 @@ echo "[pipeline] base prefix: $BASE"
 echo "[pipeline] stage 2/3: vision (Instella-VL-1B)"
 docker run --rm \
   --device=/dev/kfd --device=/dev/dri \
-  --group-add video --group-add render \
-  -v ./media/frames:/media/frames \
-  -v ./media/transcripts:/media/transcripts \
+  --group-add video \
+  --group-add render \
+  -v "$DATA_DIR/frames:/media/frames" \
+  -v "$DATA_DIR/transcripts:/media/transcripts" \
   -v goose-cli-video-transcription-recipe_hf-cache:/cache/huggingface \
   -e HSA_OVERRIDE_GFX_VERSION=10.3.0 \
   -e PYTORCH_ALLOC_CONF=expandable_segments:True \
@@ -61,12 +67,12 @@ docker run --rm \
 # --- stage 3: merge (correlate timestamps, write combined doc) ---
 echo "[pipeline] stage 3/3: merge"
 docker run --rm \
-  -v ./media:/media \
-  -v ./scripts:/scripts \
+  -v "$DATA_DIR:/media" \
+  -v "$PROJECT_DIR/scripts:/scripts" \
   --entrypoint python3 \
   "$WHISPER_IMAGE" /scripts/merge-outputs.py "$BASE" /media
 
 echo ""
 echo "[pipeline] done"
-echo "[pipeline] combined doc: media/transcripts/${BASE}-combined.md"
-echo "[pipeline] combined json: media/transcripts/${BASE}-combined.json"
+echo "[pipeline] combined doc:  $DATA_DIR/transcripts/${BASE}-combined.md"
+echo "[pipeline] combined json: $DATA_DIR/transcripts/${BASE}-combined.json"

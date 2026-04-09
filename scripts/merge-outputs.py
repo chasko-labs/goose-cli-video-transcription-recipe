@@ -187,7 +187,7 @@ def main():
         sys.exit(1)
 
     base = sys.argv[1]
-    media_root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("./media")
+    media_root = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.home() / "video-transcripts"
 
     data = build_combined(base, media_root)
 
