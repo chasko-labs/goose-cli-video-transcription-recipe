@@ -21,8 +21,9 @@ import transformers.modeling_utils as _tmu
 from pathlib import Path
 from PIL import Image
 
-# patch apply_chunking_to_forward removed in transformers 4.45
-# re-implemented from prior transformers source (apache 2.0)
+# patch functions removed/moved from transformers.modeling_utils in 4.45+
+# modeling_instellavl.py imports them from the old location
+
 if not hasattr(_tmu, 'apply_chunking_to_forward'):
     def _apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
         if chunk_size > 0:
@@ -39,19 +40,25 @@ if not hasattr(_tmu, 'apply_chunking_to_forward'):
         return forward_fn(*input_tensors)
     _tmu.apply_chunking_to_forward = _apply_chunking_to_forward
 
+# find_pruneable_heads_and_indices + prune_linear_layer moved to pytorch_utils in 4.45+
+try:
+    from transformers.pytorch_utils import (
+        find_pruneable_heads_and_indices,
+        prune_linear_layer,
+    )
+    if not hasattr(_tmu, 'find_pruneable_heads_and_indices'):
+        _tmu.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+    if not hasattr(_tmu, 'prune_linear_layer'):
+        _tmu.prune_linear_layer = prune_linear_layer
+except ImportError:
+    pass
+
 PROMPT = (
     "Describe all UI elements, text, menus, buttons, and visual content visible in this frame. "
     "Include exact text, labels, window titles, and interface details. Be specific and thorough."
 )
 
 MODEL_ID = os.environ.get("VISION_MODEL", "amd/Instella-VL-1B")
-
-# InstellaVL uses LLaVA-style vicuna conversation format
-CONV_TEMPLATE = (
-    "A chat between a curious human and an artificial intelligence assistant. "
-    "The assistant gives helpful, detailed, and polite answers to the human's questions."
-    "### Human: <image>\n{prompt}### Assistant:"
-)
 
 
 def load_model():
@@ -71,23 +78,38 @@ def load_model():
 
 def analyze_frame(model, processor, image_path):
     image = Image.open(image_path).convert("RGB")
-    prompt_text = CONV_TEMPLATE.format(prompt=PROMPT)
 
-    inputs = processor(
-        text=prompt_text,
+    # InstellaVLProcessor.encode() handles conv template + image token insertion
+    enc = processor.encode(
+        text=PROMPT,
         images=image,
-        return_tensors="pt",
+        image_processor=processor.image_processor,
+        tokenizer=processor.tokenizer,
+        model_cfg=model.config,
     )
-    inputs = {
-        k: v.to("cuda", torch.float16) if v.dtype.is_floating_point else v.to("cuda")
-        for k, v in inputs.items()
-    }
+
+    input_ids = enc["input_ids"].to("cuda")
+    image_tensor = enc.get("image_tensor")
+    image_sizes = enc.get("image_sizes")
+    stopping_criteria = enc.get("stopping_criteria")
+    eos_token_id = enc.get("eos_token_id")
+
+    if image_tensor is not None:
+        image_tensor = image_tensor.to("cuda", torch.float16)
 
     with torch.no_grad():
-        output_ids = model.generate(**inputs, max_new_tokens=300, do_sample=False)
+        output_ids = model.generate(
+            inputs=input_ids,
+            images=image_tensor,
+            image_sizes=image_sizes,
+            max_new_tokens=300,
+            do_sample=False,
+            stopping_criteria=stopping_criteria,
+            eos_token_id=eos_token_id,
+        )
 
-    input_len = inputs["input_ids"].shape[1]
-    generated = processor.decode(output_ids[0][input_len:], skip_special_tokens=True)
+    input_len = input_ids.shape[1]
+    generated = processor.tokenizer.decode(output_ids[0][input_len:], skip_special_tokens=True)
     return generated.strip()
 
 
