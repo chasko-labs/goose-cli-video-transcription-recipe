@@ -3,8 +3,10 @@ FROM rocm/pytorch:latest
 WORKDIR /app
 
 # transformers + vision deps — no model pre-download; HF cache is a volume mount
+# transformers pinned <4.45 — Instella-VL-1B custom code imports
+# apply_chunking_to_forward which was removed in 4.45
 RUN pip install --no-cache-dir \
-    transformers>=4.40.0 \
+    "transformers>=4.40,<4.45" \
     accelerate \
     einops \
     pillow \

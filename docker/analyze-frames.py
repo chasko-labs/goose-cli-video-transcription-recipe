@@ -6,6 +6,7 @@ Output: <output_dir>/<base_prefix>-frame-analysis.json
 
 Model: amd/Instella-VL-1B (VISION_MODEL env to override)
 Architecture: CLIP ViT-L/14@336 + AMD OLMo 1B SFT + 2-layer MLP projector
+Requires: transformers>=4.40,<4.45 (apply_chunking_to_forward removed in 4.45)
 """
 import sys
 import os
@@ -22,28 +23,23 @@ PROMPT = (
 
 MODEL_ID = os.environ.get("VISION_MODEL", "amd/Instella-VL-1B")
 
+# InstellaVL uses LLaVA-style vicuna conversation format
+CONV_TEMPLATE = (
+    "A chat between a curious human and an artificial intelligence assistant. "
+    "The assistant gives helpful, detailed, and polite answers to the human's questions."
+    "### Human: <image>\n{prompt}### Assistant:"
+)
+
 
 def load_model():
-    # try modern auto class first (transformers 4.45+), fall back to LlavaForConditionalGeneration
-    try:
-        from transformers import AutoProcessor, AutoModelForImageTextToText
-        print(f"[vision] loading {MODEL_ID} via AutoModelForImageTextToText", flush=True)
-        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-        model = AutoModelForImageTextToText.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-        ).to("cuda")
-    except (ImportError, AttributeError, Exception) as e:
-        print(f"[vision] auto class failed ({e}), falling back to LlavaForConditionalGeneration", flush=True)
-        from transformers import LlavaForConditionalGeneration, AutoProcessor
-        processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
-        model = LlavaForConditionalGeneration.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.float16,
-            trust_remote_code=True,
-        ).to("cuda")
-
+    from transformers import AutoModelForCausalLM, AutoProcessor
+    print(f"[vision] loading {MODEL_ID}", flush=True)
+    processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.float16,
+        trust_remote_code=True,
+    ).to("cuda")
     model.eval()
     device = next(model.parameters()).device
     print(f"[vision] {MODEL_ID} loaded on {device}", flush=True)
@@ -52,25 +48,21 @@ def load_model():
 
 def analyze_frame(model, processor, image_path):
     image = Image.open(image_path).convert("RGB")
+    prompt_text = CONV_TEMPLATE.format(prompt=PROMPT)
 
-    # LLaVA-style: try apply_chat_template; fall back to raw format string
-    try:
-        conversation = [
-            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": PROMPT}]}
-        ]
-        prompt_text = processor.apply_chat_template(conversation, add_generation_prompt=True)
-        inputs = processor(images=image, text=prompt_text, return_tensors="pt")
-    except Exception:
-        prompt_text = f"<image>\nUSER: {PROMPT}\nASSISTANT:"
-        inputs = processor(text=prompt_text, images=image, return_tensors="pt")
-
-    inputs = {k: v.to("cuda", torch.float16) if v.dtype.is_floating_point else v.to("cuda")
-              for k, v in inputs.items()}
+    inputs = processor(
+        text=prompt_text,
+        images=image,
+        return_tensors="pt",
+    )
+    inputs = {
+        k: v.to("cuda", torch.float16) if v.dtype.is_floating_point else v.to("cuda")
+        for k, v in inputs.items()
+    }
 
     with torch.no_grad():
         output_ids = model.generate(**inputs, max_new_tokens=300, do_sample=False)
 
-    # decode only the generated portion
     input_len = inputs["input_ids"].shape[1]
     generated = processor.decode(output_ids[0][input_len:], skip_special_tokens=True)
     return generated.strip()
