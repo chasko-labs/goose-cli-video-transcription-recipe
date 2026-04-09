@@ -3,11 +3,13 @@ FROM rocm/pytorch:latest
 WORKDIR /app
 
 # transformers + vision deps — no model pre-download; HF cache is a volume mount
-# latest transformers + tokenizers: tokenizer.json NFC normalizer requires tokenizers>=0.20
-# which requires transformers>=4.45. apply_chunking_to_forward (removed in 4.45)
-# is patched back in analyze-frames.py before the model loads.
+# Pin to transformers==4.49.0 (AMD official supported version for Instella-VL-1B).
+# - apply_chunking_to_forward removed in 4.45 → patched back in analyze-frames.py
+# - find_pruneable_heads_and_indices moved to pytorch_utils in 4.44+ (present in 4.49)
+# - tokenizers>=0.20 (NFC normalizer) compatible with transformers>=4.45 ✓
+# Do NOT upgrade to 5.x: find_pruneable_heads_and_indices removed entirely there.
 RUN pip install --no-cache-dir \
-    transformers \
+    "transformers==4.49.0" \
     accelerate \
     einops \
     pillow \
