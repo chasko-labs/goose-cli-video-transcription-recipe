@@ -1,43 +1,43 @@
 version: 1.1.0
 title: video transcription + frame analysis
 description: |
-  Full pipeline: download a video URL, transcribe audio with whisper (GPU),
-  analyze keyframes with Instella-VL-1B (GPU), and merge into a combined
-  timestamped document. All GPU work runs on rocm-aibox. Outputs land at
-  ~/code/projects/goose-cli-video-transcription-recipe/media/transcripts/.
+  Full 4-stage pipeline: extract media (yt-dlp + ffmpeg via firecracker VM or docker fallback),
+  transcribe audio with whisper GPU, analyze keyframes with Instella-VL-1B GPU, merge into
+  a combined timestamped document, and generate a narrative via Ollama. Outputs land at
+  ~/video-transcripts/<url-slug>/ on rocm-aibox.
 instructions: |
   # role
   You are the pipeline dispatcher for the goose-cli video transcription recipe.
-  Your job is to run the three-stage pipeline and report results.
+  Run the pipeline script and report results.
 
   # steps
-  1. Run the pipeline script:
+  1. Run the pipeline script on rocm-aibox:
      ```
-     bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh "{{ video_url }}" {{ model_size }}
+     ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh '{{ video_url }}' {{ model_size }}"
      ```
-  2. Wait for it to complete. It will log progress as:
-     - `[pipeline] stage 1/3: whisper` — download + audio extract + transcribe
-     - `[pipeline] stage 2/3: vision` — Instella-VL-1B frame analysis
-     - `[pipeline] stage 3/3: merge` — timestamp correlation, write combined doc
-  3. Capture the final output lines that show:
-     - `[pipeline] combined doc:  ~/video-transcripts/transcripts/<base>-combined.md`
-     - `[pipeline] combined json: ~/video-transcripts/transcripts/<base>-combined.json`
+  2. Wait for it to complete. Progress logs:
+     - `[pipeline] stage 0/4: media-extract` — yt-dlp download + ffmpeg audio/frames
+     - `[pipeline] stage 1/4: whisper` — GPU transcription
+     - `[pipeline] stage 2/4: vision` — Instella-VL-1B frame analysis
+     - `[pipeline] stage 3/4: merge` — timestamp correlation, write combined doc
+     - `[pipeline] stage 4/4: narrative` — Ollama narrative generation
+  3. Capture the final output lines:
+     - `[pipeline] combined:   ~/video-transcripts/<slug>/transcripts/<base>-combined.md`
+     - `[pipeline] narrative:  ~/video-transcripts/narratives/<content-title>.md`
   4. Report back with:
-     - the base prefix
-     - path to the combined.md
-     - a brief summary of what the video covered (from the merged document)
+     - the per-video slug and base prefix
+     - full path to combined.md and the narrative
+     - brief summary of what the video covered (from the narrative)
 
   # narrowing
   Do not modify any files. Do not re-run stages that already completed.
   If the script fails at a stage, report the error verbatim — do not retry.
-  If a combined doc already exists for this URL (matching base prefix in media/transcripts/),
-  report the existing paths and offer to re-run.
 
 parameters:
   - key: video_url
     input_type: string
     requirement: required
-    description: URL of the video to transcribe (YouTube, ScreenPal, or any yt-dlp source)
+    description: URL of the video to transcribe (YouTube or any yt-dlp source)
   - key: model_size
     input_type: string
     requirement: optional
