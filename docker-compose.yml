@@ -1,4 +1,8 @@
 services:
+  # NOTE: docker-compose.yml is for manual/debug use.
+  # Normal pipeline: run scripts/transcribe-headless.sh — it mounts per-video
+  # slug subdirs automatically (~/video-transcripts/<slug>/{videos,audio,frames,transcripts}).
+  # Set VIDEO_SLUG to the URL slug before using compose directly.
   whisper:
     build:
       context: ./docker
@@ -11,15 +15,42 @@ services:
       - video
       - render
     volumes:
-      - ./media/audio:/media/audio
-      - ./media/frames:/media/frames
-      - ./media/transcripts:/media/transcripts
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/${VIDEO_SLUG:?set VIDEO_SLUG}/videos:/media/videos
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/${VIDEO_SLUG}/audio:/media/audio
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/${VIDEO_SLUG}/frames:/media/frames
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/${VIDEO_SLUG}/transcripts:/media/transcripts
     environment:
       - HSA_OVERRIDE_GFX_VERSION=10.3.0
-      - PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
+      - SCENE_THRESHOLD=0.4
+    networks:
+      - heraldstack
+
+  vision:
+    build:
+      context: ./docker
+      dockerfile: vision-rocm.Dockerfile
+    container_name: transcribe-vision
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
+    volumes:
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/${VIDEO_SLUG:?set VIDEO_SLUG}/frames:/media/frames
+      - ${VIDEO_TRANSCRIPTS_DIR:-${HOME}/video-transcripts}/${VIDEO_SLUG}/transcripts:/media/transcripts
+      - hf-cache:/cache/huggingface
+    environment:
+      - HSA_OVERRIDE_GFX_VERSION=10.3.0
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
+      - VISION_MODEL=amd/Instella-VL-1B
     networks:
       - heraldstack
 
 networks:
   heraldstack:
     external: true
+
+volumes:
+  hf-cache:
