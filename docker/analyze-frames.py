@@ -111,8 +111,8 @@ def analyze_frame(model, processor, clip_processor, image_path):
             eos_token_id=eos_token_id,
         )
 
-    input_len = input_ids.shape[1]
-    generated = processor.tokenizer.decode(output_ids[0][input_len:], skip_special_tokens=True)
+    # generate() uses inputs_embeds internally — output_ids is generated-only (no input prefix)
+    generated = processor.tokenizer.decode(output_ids[0], skip_special_tokens=True)
     return generated.strip()
 
 
