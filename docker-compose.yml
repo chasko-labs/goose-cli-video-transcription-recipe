@@ -11,12 +11,14 @@ services:
       - video
       - render
     volumes:
+      - ./media/videos:/media/videos
       - ./media/audio:/media/audio
       - ./media/frames:/media/frames
       - ./media/transcripts:/media/transcripts
     environment:
       - HSA_OVERRIDE_GFX_VERSION=10.3.0
-      - PYTORCH_HIP_ALLOC_CONF=expandable_segments:True
+      - PYTORCH_ALLOC_CONF=expandable_segments:True
+      - SCENE_THRESHOLD=0.4
     networks:
       - heraldstack
 

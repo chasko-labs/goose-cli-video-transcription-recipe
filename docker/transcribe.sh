@@ -1,49 +1,54 @@
 #!/bin/bash
 # transcribe.sh — pipeline entrypoint
 # usage: transcribe.sh <video-url> [model-size]
-# output: timestamped transcript in /media/transcripts/
+# output: timestamped transcript + frames in /media/
 set -uo pipefail
 
 URL="${1:?usage: transcribe.sh <video-url> [model-size]}"
 MODEL="${2:-medium}"
+SCENE_THRESHOLD="${SCENE_THRESHOLD:-0.4}"
 
 AUDIO_DIR="/media/audio"
 FRAMES_DIR="/media/frames"
 TRANSCRIPT_DIR="/media/transcripts"
-mkdir -p "$AUDIO_DIR" "$FRAMES_DIR" "$TRANSCRIPT_DIR"
+VIDEO_DIR="/media/videos"
+mkdir -p "$AUDIO_DIR" "$FRAMES_DIR" "$TRANSCRIPT_DIR" "$VIDEO_DIR"
 
-# derive a slug from the URL for filenames
-SLUG=$(echo "$URL" | sed 's|https\?://||;s|[^a-zA-Z0-9]|_|g' | head -c 60)
+SLUG=$(echo "$URL" | sed 's|https\?://||;s|[^a-zA-Z0-9]|_|g' | cut -c1-60)
 TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 BASE="${TIMESTAMP}_${SLUG}"
 
-echo "[transcribe] downloading audio from $URL"
-yt-dlp -x --audio-format wav --audio-quality 0 \
-  -o "${AUDIO_DIR}/${BASE}.%(ext)s" \
-  "$URL" 2>&1 || {
-    echo "[transcribe] yt-dlp failed — trying direct download"
-    curl -sL "$URL" -o "${AUDIO_DIR}/${BASE}.wav"
-  }
+# download full video — needed for both audio and frame extraction
+echo "[transcribe] downloading video from $URL"
+yt-dlp --format "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+  --merge-output-format mp4 \
+  -o "${VIDEO_DIR}/${BASE}.%(ext)s" \
+  "$URL" 2>&1
 
-AUDIO_FILE=$(ls -t "${AUDIO_DIR}/${BASE}"*.wav 2>/dev/null | head -1)
-if [ -z "$AUDIO_FILE" ]; then
-  echo "[transcribe] error: no audio file produced" >&2
+VIDEO_FILE=$(ls -t "${VIDEO_DIR}/${BASE}"*.mp4 2>/dev/null | head -1)
+if [ -z "$VIDEO_FILE" ]; then
+  echo "[transcribe] error: no video file produced" >&2
   exit 1
 fi
+echo "[transcribe] video: $VIDEO_FILE"
 
-echo "[transcribe] extracting frames (scene detection)"
-ffmpeg -i "$AUDIO_FILE" -vn -acodec copy /dev/null 2>&1 || true
-# if the source was a video, extract key frames
-VIDEO_FILE=$(ls -t "${AUDIO_DIR}/${BASE}"*.mp4 "${AUDIO_DIR}/${BASE}"*.webm 2>/dev/null | head -1)
-if [ -n "$VIDEO_FILE" ]; then
-  ffmpeg -i "$VIDEO_FILE" \
-    -vf "select='gt(scene,0.4)'" \
-    -vsync vfr \
-    "${FRAMES_DIR}/${BASE}_frame_%04d.png" 2>/dev/null || true
-  echo "[transcribe] frames extracted to ${FRAMES_DIR}/"
-fi
+# extract audio for whisper
+echo "[transcribe] extracting audio"
+AUDIO_FILE="${AUDIO_DIR}/${BASE}.wav"
+ffmpeg -i "$VIDEO_FILE" -vn -acodec pcm_s16le -ar 16000 -ac 1 "$AUDIO_FILE" 2>&1
+echo "[transcribe] audio: $AUDIO_FILE"
 
-echo "[transcribe] running whisper model=$MODEL on $AUDIO_FILE"
+# extract frames via scene detection
+echo "[transcribe] extracting frames (scene threshold: $SCENE_THRESHOLD)"
+ffmpeg -i "$VIDEO_FILE" \
+  -vf "select='gt(scene,${SCENE_THRESHOLD})',scale=1280:-2" \
+  -vsync vfr \
+  "${FRAMES_DIR}/${BASE}_frame_%04d.png" 2>&1
+FRAME_COUNT=$(ls "${FRAMES_DIR}/${BASE}_frame_"*.png 2>/dev/null | wc -l)
+echo "[transcribe] frames extracted: $FRAME_COUNT"
+
+# transcribe audio on GPU
+echo "[transcribe] running whisper model=$MODEL"
 whisper "$AUDIO_FILE" \
   --model "$MODEL" \
   --output_dir "$TRANSCRIPT_DIR" \
@@ -51,5 +56,6 @@ whisper "$AUDIO_FILE" \
   --verbose False \
   2>&1
 
-echo "[transcribe] done — outputs in ${TRANSCRIPT_DIR}/"
-ls -la "${TRANSCRIPT_DIR}/${BASE}"* 2>/dev/null
+echo "[transcribe] done"
+echo "[transcribe] transcript: ${TRANSCRIPT_DIR}/${BASE}.*"
+echo "[transcribe] frames:     ${FRAMES_DIR}/${BASE}_frame_*.png ($FRAME_COUNT)"
