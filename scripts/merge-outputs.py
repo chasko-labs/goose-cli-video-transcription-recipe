@@ -78,7 +78,9 @@ def find_segment_for_timestamp(segments: list[dict], ts: float) -> dict | None:
 
 def build_combined(base: str, media_root: Path) -> dict:
     transcripts = media_root / "transcripts"
-    whisper_path = transcripts / f"{base}.json"
+    # prefer tightened transcript if available
+    tightened_path = transcripts / f"{base}-tightened.json"
+    whisper_path = tightened_path if tightened_path.exists() else transcripts / f"{base}.json"
     vision_path = transcripts / f"{base}-frame-analysis.json"
     video_path = media_root / "videos" / f"{base}.mp4"
 
@@ -86,6 +88,9 @@ def build_combined(base: str, media_root: Path) -> dict:
         raise FileNotFoundError(f"whisper JSON not found: {whisper_path}")
     if not vision_path.exists():
         raise FileNotFoundError(f"frame analysis JSON not found: {vision_path}")
+
+    if "tightened" in whisper_path.name:
+        print(f"[merge] using tightened transcript: {whisper_path.name}")
 
     whisper = json.loads(whisper_path.read_text())
     vision = json.loads(vision_path.read_text())
