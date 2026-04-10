@@ -177,6 +177,16 @@ run_pipeline() {
   # defensive defaults — guards against referencing unset vars if stages skip
   local S0_ELAPSED=0 S1_ELAPSED=0 S2_ELAPSED=0 S3_ELAPSED=0 S4_ELAPSED=0
 
+  # pre-stage-0 audio-only detection from URL pattern
+  if [[ "$AUDIO_ONLY" = "auto" ]]; then
+    case "$URL" in
+      *.mp3*|*.wav*|*.ogg*|*.m4a*|*.aac*|*.flac*|*podcast*|*audio.mp3*)
+        AUDIO_ONLY=true
+        echo "[pipeline] auto-detected audio-only (url pattern)"
+        ;;
+    esac
+  fi
+
   # =========================================================================
   # stage 0: media-extract via fc-pool
   # =========================================================================
@@ -193,6 +203,41 @@ run_pipeline() {
     # check if whisper output also exists (from prior fallback run)
     if [[ -f "$VIDEO_DIR/transcripts/${BASE}.json" ]]; then
       WHISPER_DONE=true
+    fi
+  elif [[ "$AUDIO_ONLY" = true ]]; then
+    # audio-only stage 0: download + convert to wav, skip frames
+    echo "[pipeline] stage 0/4: audio-only media extract"
+    update_status 0 "media-extract" "running"
+
+    BASE=$(date +%Y%m%d_%H%M%S)_$(echo "$SLUG" | cut -c1-40)
+    timeout "$TIMEOUT_STAGE0" docker run --rm \
+      -v "$VIDEO_DIR/audio:/media/audio" \
+      -v "$VIDEO_DIR/videos:/media/videos" \
+      -v "$VIDEO_DIR/transcripts:/media/transcripts" \
+      --entrypoint bash \
+      "$WHISPER_IMAGE" -c "
+        set -e
+        echo '[audio-extract] downloading audio'
+        yt-dlp --no-playlist -o '/media/videos/${BASE}.%(ext)s' '${URL}' 2>&1
+        SRC=\$(ls -t /media/videos/${BASE}.* 2>/dev/null | head -1)
+        if [ -z \"\$SRC\" ]; then
+          echo '[audio-extract] error: no file downloaded' >&2
+          exit 1
+        fi
+        echo \"[audio-extract] converting \$SRC to wav\"
+        ffmpeg -i \"\$SRC\" -ar 16000 -ac 1 -c:a pcm_s16le \"/media/audio/${BASE}.wav\" -y 2>&1
+        echo '[audio-extract] fetching metadata'
+        yt-dlp --dump-json --no-download '${URL}' 2>/dev/null | grep '^{' > /media/transcripts/metadata.json || true
+        echo '[audio-extract] done'
+      " 2>&1
+
+    if [[ ! -f "$VIDEO_DIR/audio/${BASE}.wav" ]]; then
+      echo "[pipeline] error: audio-only extract failed" >&2
+      S0_END=$(now_s)
+      S0_ELAPSED=$((S0_END - S0_START))
+      update_status 0 "media-extract" "failed" "$S0_ELAPSED"
+      send_trace "stage-0-media-extract" "$S0_START_NS" "$(now_ns)" "error" "stage=0" "mode=audio-only"
+      return 1
     fi
   else
     echo "[pipeline] stage 0/4: media-extract (fc-pool)"
