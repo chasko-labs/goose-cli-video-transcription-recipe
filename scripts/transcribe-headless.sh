@@ -15,6 +15,7 @@ FORCE=false
 DRY_RUN=false
 BATCH_FILE=""
 PARALLEL_N=1
+AUDIO_ONLY=auto
 POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
@@ -23,6 +24,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run) DRY_RUN=true; shift ;;
     --batch) BATCH_FILE="$2"; shift 2 ;;
     --parallel) PARALLEL_N="$2"; shift 2 ;;
+    --audio-only) AUDIO_ONLY=true; shift ;;
     *) POSITIONAL+=("$1"); shift ;;
   esac
 done
@@ -91,10 +93,11 @@ do_dry_run() {
   local vdir="$DATA_DIR/$slug"
 
   echo "--- dry-run ---"
-  echo "url:   $url"
-  echo "slug:  $slug"
-  echo "model: $model"
-  echo "dir:   $vdir"
+  echo "url:        $url"
+  echo "slug:       $slug"
+  echo "model:      $model"
+  echo "audio-only: $AUDIO_ONLY"
+  echo "dir:        $vdir"
   echo ""
 
   # docker images
@@ -270,6 +273,55 @@ except Exception:
   echo "[pipeline] base: $BASE"
 
   # =========================================================================
+  # audio-only inference
+  # =========================================================================
+  if [[ "$AUDIO_ONLY" = "auto" ]]; then
+    # check frame count
+    local FRAME_COUNT
+    FRAME_COUNT=$(ls "${VIDEO_DIR}/frames/"*.png 2>/dev/null | wc -l)
+    if [[ "$FRAME_COUNT" -eq 0 ]]; then
+      AUDIO_ONLY=true
+      echo "[pipeline] auto-detected audio-only (no frames extracted)"
+    fi
+    # check metadata for audio-only content
+    if [[ "$AUDIO_ONLY" = "auto" ]] && [[ -f "$VIDEO_DIR/transcripts/metadata.json" ]]; then
+      local VCODEC
+      VCODEC=$(python3 -c "import json; m=json.load(open('$VIDEO_DIR/transcripts/metadata.json')); print(m.get('vcodec',''))" 2>/dev/null)
+      if [[ "$VCODEC" == "none" ]]; then
+        AUDIO_ONLY=true
+        echo "[pipeline] auto-detected audio-only (vcodec=none)"
+      fi
+      # check categories for podcast/music
+      local IS_PODCAST
+      IS_PODCAST=$(python3 -c "
+import json
+m=json.load(open('$VIDEO_DIR/transcripts/metadata.json'))
+cats=[c.lower() for c in m.get('categories',[])]
+tags=[t.lower() for t in m.get('tags',[])]
+print('true' if any(k in ' '.join(cats+tags) for k in ['podcast','audiobook','audio only']) else 'false')
+" 2>/dev/null)
+      if [[ "$IS_PODCAST" == "true" ]]; then
+        AUDIO_ONLY=true
+        echo "[pipeline] auto-detected audio-only (podcast/audio content)"
+      fi
+    fi
+    # if still auto, default to false (video content)
+    if [[ "$AUDIO_ONLY" = "auto" ]]; then
+      AUDIO_ONLY=false
+    fi
+  fi
+
+  # if audio-only, create stub frame-analysis so merge can proceed
+  if [[ "$AUDIO_ONLY" = true ]] && [[ ! -f "$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json" ]]; then
+    python3 -c "
+import json
+with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
+    json.dump({'base': '$BASE', 'model': 'audio-only', 'frames': []}, f, indent=2)
+"
+    echo "[pipeline] audio-only: created stub frame-analysis"
+  fi
+
+  # =========================================================================
   # stages 1+2: whisper + vision (parallel GPU stages)
   # =========================================================================
   local S1_SKIP=false S2_SKIP=false
@@ -280,6 +332,10 @@ except Exception:
   fi
   if [[ "$WHISPER_DONE" = true ]]; then
     S1_SKIP=true
+  fi
+  # skip vision if audio-only or output exists
+  if [[ "$AUDIO_ONLY" = true ]]; then
+    S2_SKIP=true
   fi
   if [[ "$FORCE" = false ]] && [[ -f "$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json" ]]; then
     S2_SKIP=true
@@ -409,6 +465,25 @@ except Exception:
   fi
 
   # =========================================================================
+  # tighten transcript (between stages 1+2 and merge)
+  # =========================================================================
+  if [[ -f "$VIDEO_DIR/transcripts/${BASE}.json" ]]; then
+    if [[ "$FORCE" = true ]] || [[ ! -f "$VIDEO_DIR/transcripts/${BASE}-tightened.json" ]]; then
+      echo "[pipeline] tightening transcript"
+      local TIGHT_START TIGHT_START_NS
+      TIGHT_START=$(now_s)
+      TIGHT_START_NS=$(now_ns)
+      python3 "$PROJECT_DIR/scripts/tighten.py" transcript \
+        "$VIDEO_DIR/transcripts/${BASE}.json" \
+        "$VIDEO_DIR/transcripts/${BASE}-tightened.json"
+      local TIGHT_ELAPSED=$(($(now_s) - TIGHT_START))
+      send_trace "tighten-transcript" "$TIGHT_START_NS" "$(now_ns)" "ok" "type=transcript"
+    else
+      echo "[pipeline] tighten transcript: skipped (output exists)"
+    fi
+  fi
+
+  # =========================================================================
   # stage 3: merge
   # =========================================================================
   local S3_START S3_START_NS S3_END S3_ELAPSED
@@ -479,6 +554,24 @@ except Exception:
     echo "[pipeline] stage 4 done (${S4_ELAPSED}s)"
     update_status 4 "narrative" "done" "$S4_ELAPSED"
     send_trace "stage-4-narrative" "$S4_START_NS" "$(now_ns)" "ok" "stage=4"
+  fi
+
+  # =========================================================================
+  # tighten narrative (after stage 4)
+  # =========================================================================
+  # find the narrative file that was just written
+  local NARR_FILE
+  NARR_FILE=$(ls -t "$NARRATIVES_DIR/"*.md 2>/dev/null | head -1)
+  if [[ -n "$NARR_FILE" ]]; then
+    echo "[pipeline] tightening narrative"
+    local TIGHT_N_START TIGHT_N_START_NS
+    TIGHT_N_START=$(now_s)
+    TIGHT_N_START_NS=$(now_ns)
+    timeout 120 python3 "$PROJECT_DIR/scripts/tighten.py" narrative "$NARR_FILE" 2>&1 || \
+      echo "[pipeline] narrative tightening failed (non-fatal)"
+    local TIGHT_N_ELAPSED=$(($(now_s) - TIGHT_N_START))
+    echo "[pipeline] tighten narrative done (${TIGHT_N_ELAPSED}s)"
+    send_trace "tighten-narrative" "$TIGHT_N_START_NS" "$(now_ns)" "ok" "type=narrative"
   fi
 
   # =========================================================================
