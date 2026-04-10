@@ -116,6 +116,10 @@ for podcasts and direct audio urls:
 - parallel batch mode e2e validation
 - rss feed ingestion (parse feed, extract episode urls, batch process)
 
+## setup
+
+see [docs/setup-guide.md](docs/setup-guide.md) — step-by-step build order from single-stage whisper test to full pipeline with fc-pool. each step is independently testable. includes known constraints, design decisions, and gpu memory considerations
+
 ## lineage
 
 originally [kiro-cli-custom-agent-screenpal-video-transcription](https://github.com/chasko-labs/kiro-cli-custom-agent-screenpal-video-transcription). migrated to goose-cli recipes for headless ssh dispatch and recipe-based orchestration. original kiro-cli code preserved in `reference/kiro-original/`
