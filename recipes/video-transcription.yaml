@@ -1,48 +1,69 @@
 version: 1.1.0
-title: video transcription + frame analysis
+title: video + podcast transcription pipeline
 description: |
-  Full 4-stage pipeline: extract media (yt-dlp + ffmpeg via firecracker VM or docker fallback),
-  transcribe audio with whisper GPU, analyze keyframes with Instella-VL-1B GPU, merge into
-  a combined timestamped document, and generate a narrative via Ollama. Outputs land at
-  ~/video-transcripts/<url-slug>/ on rocm-aibox.
+  5-stage pipeline with tightener: extract media (fc-pool microvm or docker fallback),
+  transcribe audio with whisper gpu, analyze keyframes with instella-vl-1b gpu,
+  tighten transcript (filler removal), merge into timestamped document, generate
+  narrative via ollama, tighten narrative prose. supports video urls, podcast rss
+  episode urls, and direct audio files. auto-detects audio-only content.
+  outputs: ~/video-transcripts/<url-slug>/ on rocm-aibox.
 instructions: |
   # role
   You are the pipeline dispatcher for the goose-cli video transcription recipe.
   Run the pipeline script and report results.
 
   # steps
-  1. Run the pipeline script on rocm-aibox:
+  1. Run the pipeline on rocm-aibox:
      ```
-     ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh '{{ video_url }}' {{ model_size }}"
+     ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh '{{ video_url }}' {{ model_size }} {{ extra_flags }}"
      ```
   2. Wait for it to complete. Progress logs:
      - `[pipeline] stage 0/4: media-extract` — yt-dlp download + ffmpeg audio/frames
-     - `[pipeline] stage 1/4: whisper` — GPU transcription
-     - `[pipeline] stage 2/4: vision` — Instella-VL-1B frame analysis
-     - `[pipeline] stage 3/4: merge` — timestamp correlation, write combined doc
-     - `[pipeline] stage 4/4: narrative` — Ollama narrative generation
+     - `[pipeline] stage 1/4: whisper` — gpu transcription
+     - `[pipeline] stage 2/4: vision` — instella-vl-1b frame analysis (skipped if audio-only)
+     - `[pipeline] tightening transcript` — regex filler removal
+     - `[pipeline] stage 3/4: merge` — timestamp correlation, combined doc
+     - `[pipeline] stage 4/4: narrative` — ollama narrative generation
+     - `[pipeline] tightening narrative` — ollama prose tightening
   3. Capture the final output lines:
      - `[pipeline] combined:   ~/video-transcripts/<slug>/transcripts/<base>-combined.md`
      - `[pipeline] narrative:  ~/video-transcripts/narratives/<content-title>.md`
   4. Report back with:
      - the per-video slug and base prefix
      - full path to combined.md and the narrative
-     - brief summary of what the video covered (from the narrative)
+     - whether audio-only was detected
+     - brief summary of what the content covered (from the narrative)
+
+  # batch mode
+  For multiple URLs, create a file with one URL per line and use:
+  ```
+  ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh --batch /path/to/urls.txt --parallel 2"
+  ```
+  Report the manifest path and summary table.
+
+  # monitoring
+  - poll status: `ssh rocm-aibox "cat ~/video-transcripts/<slug>/status.json"`
+  - view traces: http://rocm-aibox.local:16686 (jaeger ui)
 
   # narrowing
-  Do not modify any files. Do not re-run stages that already completed.
+  Do not modify any files. Do not re-run stages that already completed (resume is automatic).
   If the script fails at a stage, report the error verbatim — do not retry.
 
 parameters:
   - key: video_url
     input_type: string
     requirement: required
-    description: URL of the video to transcribe (YouTube or any yt-dlp source)
+    description: URL of the video or podcast to transcribe (youtube, direct mp3, any yt-dlp source)
   - key: model_size
     input_type: string
     requirement: optional
     default: medium
     description: "whisper model size: tiny | base | small | medium | large"
+  - key: extra_flags
+    input_type: string
+    requirement: optional
+    default: ""
+    description: "additional flags: --force --dry-run --audio-only"
 
 extensions:
   - type: builtin
@@ -55,6 +76,7 @@ settings:
   temperature: 0.1
 
 prompt: |
-  Transcribe and analyze this video: {{ video_url }}
+  Transcribe and analyze this content: {{ video_url }}
   Whisper model: {{ model_size }}
+  Extra flags: {{ extra_flags }}
   Run the full pipeline and report the output paths and a brief summary.

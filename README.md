@@ -34,6 +34,7 @@ ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/script
 # with flags
 --force          re-run all stages (ignore existing outputs)
 --dry-run        print plan without executing
+--audio-only     skip vision, use audio-only download path (auto-inferred if omitted)
 
 # batch mode
 --batch <file>   process urls from file (one per line, # comments ok)
@@ -63,7 +64,8 @@ NARRATIVE_MODEL=...  ollama model override (default: llama3.1:8b)
     transcripts/
       metadata.json                   yt-dlp metadata
       <base>.json                     whisper segments
-      <base>-frame-analysis.json      vision descriptions
+      <base>-frame-analysis.json      vision descriptions (stub if audio-only)
+      <base>-tightened.json           filler-removed transcript
       <base>-combined.json            correlated audio + visual
       <base>-combined.md              human-readable merged doc
     status.json                       pipeline state
@@ -78,6 +80,7 @@ NARRATIVE_MODEL=...  ollama model override (default: llama3.1:8b)
 | scripts/transcribe-headless.sh | main orchestrator — arg parsing, stage dispatch, timing, tracing, resume |
 | scripts/batch.sh | batch mode orchestration (sourced by main script) |
 | scripts/trace.py | otlp http json span sender for jaeger (stdlib only) |
+| scripts/tighten.py | filler removal (regex) + narrative prose tightening (ollama) |
 | scripts/merge-outputs.py | stage 3 — correlate whisper segments + vision frames by timestamp |
 | scripts/generate-narrative.py | stage 4 — build llm prompt, call ollama, write narrative md |
 
@@ -90,12 +93,28 @@ NARRATIVE_MODEL=...  ollama model override (default: llama3.1:8b)
 
 built automatically on first run if missing
 
+## tightener
+
+two-pass filler removal runs automatically on every pipeline execution:
+
+- **pass 1 (regex, instant)**: strips filler words (um, uh, you know, I mean, repeated words) from whisper transcript, writes `<base>-tightened.json`. merge prefers this over raw transcript
+- **pass 2 (ollama, ~5-10s)**: sends narrative through llm to remove formulaic transitions and padding. tightens in place
+
+## audio-only mode
+
+for podcasts and direct audio urls:
+
+- `--audio-only` flag explicitly skips vision
+- auto-inferred from: url pattern (.mp3, .wav, podcast), yt-dlp vcodec=none, podcast tags in metadata, zero frames after extraction
+- dedicated audio-only stage 0: yt-dlp download + ffmpeg wav conversion (bypasses container transcribe.sh which expects video)
+- creates stub frame-analysis.json so merge proceeds with 0 frames
+- tested with aws podcast rss feed, omny podcast episodes
+
 ## roadmap
 
-- `--audio-only` flag for podcast transcription (skip vision, audio-only narrative prompt)
-- tightener agent — post-processing stage that polishes llm narrative output (tighter prose, remove formulaic patterns, enforce style)
 - fc-pool av1 codec support in microvm rootfs
 - parallel batch mode e2e validation
+- rss feed ingestion (parse feed, extract episode urls, batch process)
 
 ## lineage
 
