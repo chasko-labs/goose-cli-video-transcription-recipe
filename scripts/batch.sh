@@ -2,6 +2,16 @@
 # batch.sh — batch orchestration for transcribe-headless.sh
 # sourced by transcribe-headless.sh, not called directly
 # expects: run_pipeline(), now_s(), DATA_DIR, FORCE, NARRATIVES_DIR, STAGE_NAMES
+#
+# gpu semaphore (t-02) — batch parallelism note:
+#   --parallel <N> with N>1 launches multiple run_pipeline() subshells concurrently.
+#   each pipeline's whisper and vision stages independently acquire gpu_lock via
+#   gpu_acquire() before their docker-run calls. this serializes actual GPU use
+#   correctly — only one stage holds gpu_lock at any moment across all parallel
+#   pipelines. however, N>1 does NOT increase GPU throughput; it only pipelines
+#   the non-GPU stages (media-extract, merge, narrative) around the serialized
+#   GPU stages. the comment "parallel>1 queues on gpu lock, not truly parallelizes"
+#   is accurate — treat --parallel as overlap optimization, not GPU parallelism.
 
 process_batch() {
   local batch_file="$1"
@@ -20,12 +30,12 @@ process_batch() {
     line="$(echo "$line" | xargs)"
     [[ -z "$line" ]] && continue
     urls+=("$line")
-  done < "$batch_file"
+  done <"$batch_file"
 
   local total=${#urls[@]}
   echo "[batch] $total URLs, parallel=$max_parallel"
 
-  if (( total == 0 )); then
+  if ((total == 0)); then
     echo "[batch] no URLs found in $batch_file"
     return 1
   fi
@@ -39,16 +49,16 @@ process_batch() {
     local slug
     slug=$(echo "$url" | sed 's|https\?://||;s|www\.||;s|[^a-zA-Z0-9]|_|g' | sed 's|_\+|_|g;s|^_\|_$||g' | cut -c1-60)
 
-    if (( max_parallel > 1 )); then
+    if ((max_parallel > 1)); then
       # throttle to max_parallel
-      while (( active >= max_parallel )); do
+      while ((active >= max_parallel)); do
         wait -n 2>/dev/null
         ((active--))
       done
       (
         local start end rc
         start=$(now_s)
-        run_pipeline "$url" "$model" > "$tmpdir/${i}.log" 2>&1
+        run_pipeline "$url" "$model" >"$tmpdir/${i}.log" 2>&1
         rc=$?
         end=$(now_s)
         local status_str="done"
