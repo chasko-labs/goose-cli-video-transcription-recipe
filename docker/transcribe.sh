@@ -4,6 +4,15 @@
 # output: timestamped transcript + frames in /media/
 # note: /media/{videos,audio,frames,transcripts} are mounted from the host
 #       per-video slug subfolder is handled by the host (transcribe-headless.sh)
+#
+# gpu semaphore (t-02) — fallback path note:
+#   this script runs inside the whisper-rocm container via the stage-0 fc-pool
+#   fallback in transcribe-headless.sh. the host-side subshell that invokes this
+#   container holds gpu_lock for the duration (acquire before docker-run, release
+#   on subshell EXIT trap). this container does NOT call valkey directly — the
+#   lock boundary is at the docker-run call site in transcribe-headless.sh.
+#   if this script is ever invoked outside of that host-side wrapper (e.g. manual
+#   docker run for testing), no gpu lock is held. document that at the call site.
 set -uo pipefail
 
 URL="${1:?usage: transcribe.sh <video-url> [model-size]}"
@@ -23,8 +32,8 @@ BASE="$TIMESTAMP"
 # --- metadata: fetch before download so we have title/uploader for context ---
 echo "[transcribe] fetching metadata"
 # 2>/dev/null: suppress warnings that would corrupt the JSON file
-yt-dlp --dump-json "$URL" 2>/dev/null | grep "^{" > "${TRANSCRIPT_DIR}/metadata.json" \
-  || echo "[transcribe] warning: metadata fetch failed (non-fatal)"
+yt-dlp --dump-json "$URL" 2>/dev/null | grep "^{" >"${TRANSCRIPT_DIR}/metadata.json" ||
+  echo "[transcribe] warning: metadata fetch failed (non-fatal)"
 
 # download full video — needed for both audio and frame extraction
 echo "[transcribe] downloading video from $URL"

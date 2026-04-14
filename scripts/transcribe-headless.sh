@@ -20,12 +20,30 @@ POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --force) FORCE=true; shift ;;
-    --dry-run) DRY_RUN=true; shift ;;
-    --batch) BATCH_FILE="$2"; shift 2 ;;
-    --parallel) PARALLEL_N="$2"; shift 2 ;;
-    --audio-only) AUDIO_ONLY=true; shift ;;
-    *) POSITIONAL+=("$1"); shift ;;
+    --force)
+      FORCE=true
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --batch)
+      BATCH_FILE="$2"
+      shift 2
+      ;;
+    --parallel)
+      PARALLEL_N="$2"
+      shift 2
+      ;;
+    --audio-only)
+      AUDIO_ONLY=true
+      shift
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      shift
+      ;;
   esac
 done
 
@@ -82,6 +100,95 @@ send_trace() {
   python3 "$TRACE_PY" send "$JAEGER_OTLP" "$TRACE_ID" \
     "$(python3 "$TRACE_PY" id "${span_name}-${SLUG}" 8)" \
     "$span_name" "$start_ns" "$end_ns" "$status" "$PIPELINE_SPAN" "$@" 2>/dev/null &
+}
+
+# --- gpu semaphore (t-02) ---
+#
+# transport boundary:
+#   key:     gpu_lock
+#   value:   <pid>-<hostname>-<stage>  (owner_id — used for compare-and-delete)
+#   acquire: SET gpu_lock <owner_id> NX EX 1200
+#            NX = only set if absent (mutex)
+#            EX 1200 = orphan backstop; TTL > longest stage (TIMEOUT_STAGE1=900s,
+#                      TIMEOUT_STAGE2=600s). DEL on clean exit is load-bearing;
+#                      TTL is last-resort only.
+#   release: GET gpu_lock → compare to owner_id → DEL only if match
+#            prevents a ttl-expired-then-reacquired race from releasing a new
+#            owner's lock. no lua required: a single pid can only own one stage
+#            at a time and releases only what it acquired.
+#   retry:   exponential backoff, base 2s, max 5 attempts (2,4,8,16,32 = 62s)
+#            fail-fast after 5 misses with actionable error message
+#   cleanup: trap EXIT/SIGINT/SIGTERM in every subshell that calls gpu_acquire
+#            outer trap at run_pipeline() level covers tmpfile cleanup + lock release
+#
+# valkey transport: docker exec heraldstack-valkey valkey-cli
+#   (no redis-cli / valkey-cli binary on the aibox host; valkey/valkey:latest
+#    container at localhost:6379 exposes valkey-cli internally)
+# env overrides: VALKEY_CONTAINER (default: heraldstack-valkey)
+#                VALKEY_HOST / VALKEY_PORT (informational only for this impl;
+#                docker exec ignores them — change valkey_cmd() if host cli
+#                becomes available)
+
+VALKEY_CONTAINER="${VALKEY_CONTAINER:-heraldstack-valkey}"
+
+# low-level valkey command wrapper — all semaphore calls go through here
+valkey_cmd() {
+  docker exec "$VALKEY_CONTAINER" valkey-cli "$@" 2>/dev/null
+}
+
+# gpu_acquire <stage>
+#   sets gpu_lock to "<pid>-<hostname>-<stage>" with NX EX 1200
+#   retries with exponential backoff (base 2s, max 5 attempts)
+#   on success: exports GPU_LOCK_OWNER for use by gpu_release
+#   on failure: prints actionable error, returns 1
+gpu_acquire() {
+  local stage="$1"
+  local owner
+  owner="$$-$(hostname -s)-${stage}"
+  local delay=2
+  local max_attempts=5
+  local attempt=0
+
+  while ((attempt < max_attempts)); do
+    local result
+    result=$(valkey_cmd SET gpu_lock "$owner" NX EX 1200)
+    if [[ "$result" == "OK" ]]; then
+      echo "[gpu-lock] acquired: owner=$owner"
+      GPU_LOCK_OWNER="$owner"
+      export GPU_LOCK_OWNER
+      return 0
+    fi
+    local held_by
+    held_by=$(valkey_cmd GET gpu_lock 2>/dev/null || echo "unknown")
+    echo "[gpu-lock] lock held by '$held_by' — retry $((attempt + 1))/$max_attempts in ${delay}s"
+    sleep "$delay"
+    delay=$((delay * 2))
+    ((attempt++))
+  done
+
+  echo "[gpu-lock] error: could not acquire gpu_lock after $max_attempts attempts" \
+    "(last holder: $(valkey_cmd GET gpu_lock 2>/dev/null || echo 'unknown'))" >&2
+  echo "[gpu-lock] error: check for stale lock or increase TIMEOUT_STAGE1/TIMEOUT_STAGE2" >&2
+  return 1
+}
+
+# gpu_release
+#   GET gpu_lock, compare to GPU_LOCK_OWNER, DEL only if match
+#   safe to call when no lock is held (no-op)
+gpu_release() {
+  local owner="${GPU_LOCK_OWNER:-}"
+  if [[ -z "$owner" ]]; then
+    return 0
+  fi
+  local held_by
+  held_by=$(valkey_cmd GET gpu_lock 2>/dev/null || echo "")
+  if [[ "$held_by" == "$owner" ]]; then
+    valkey_cmd DEL gpu_lock >/dev/null
+    echo "[gpu-lock] released: owner=$owner"
+  else
+    echo "[gpu-lock] release skipped: lock not owned by us (held='$held_by', ours='$owner')"
+  fi
+  GPU_LOCK_OWNER=""
 }
 
 # --- dry-run ---
@@ -180,7 +287,7 @@ run_pipeline() {
   # pre-stage-0 audio-only detection from URL pattern
   if [[ "$AUDIO_ONLY" = "auto" ]]; then
     case "$URL" in
-      *.mp3*|*.wav*|*.ogg*|*.m4a*|*.aac*|*.flac*|*podcast*|*audio.mp3*)
+      *.mp3* | *.wav* | *.ogg* | *.m4a* | *.aac* | *.flac* | *podcast* | *audio.mp3*)
         AUDIO_ONLY=true
         echo "[pipeline] auto-detected audio-only (url pattern)"
         ;;
@@ -243,7 +350,8 @@ run_pipeline() {
     echo "[pipeline] stage 0/4: media-extract (fc-pool)"
     update_status 0 "media-extract" "running"
 
-    MEDIA_EXTRACT_BODY=$(cat <<JSONEOF
+    MEDIA_EXTRACT_BODY=$(
+      cat <<JSONEOF
 {"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"extract_media","arguments":{"url":"${URL}","model":"${MODEL}"}}}
 JSONEOF
     )
@@ -277,6 +385,18 @@ except Exception:
 
     if [ "$FC_OK" = false ] || [ -z "$BASE" ]; then
       echo "[pipeline] fc-pool unavailable or parse failed — falling back to in-container media extract"
+      # transport boundary: acquire gpu_lock before the fallback docker-run.
+      # this path runs in the main shell (not a subshell), so the outer EXIT trap
+      # on run_pipeline() covers release if the function returns early or the
+      # process is killed. gpu_release is idempotent when GPU_LOCK_OWNER is unset.
+      if ! gpu_acquire "fallback"; then
+        echo "[pipeline] error: could not acquire gpu_lock for stage-0 fallback" >&2
+        S0_END=$(now_s)
+        S0_ELAPSED=$((S0_END - S0_START))
+        update_status 0 "media-extract" "failed" "$S0_ELAPSED"
+        send_trace "stage-0-media-extract" "$S0_START_NS" "$(now_ns)" "error" "stage=0"
+        return 1
+      fi
       WHISPER_OUT=$(timeout "$TIMEOUT_STAGE0" docker run --rm \
         --device=/dev/kfd --device=/dev/dri \
         --group-add video \
@@ -289,6 +409,8 @@ except Exception:
         -e PYTORCH_ALLOC_CONF=expandable_segments:True \
         -e SCENE_THRESHOLD=0.4 \
         "$WHISPER_IMAGE" "$URL" "$MODEL" 2>&1)
+      # release immediately after docker-run completes — stages 1+2 need the lock
+      gpu_release
       echo "$WHISPER_OUT"
 
       BASE=$(echo "$WHISPER_OUT" | grep '\[transcribe\] transcript:' | sed 's|.*transcripts/||;s|\.\*||' | tr -d ' ')
@@ -389,23 +511,36 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
   local S1_RESULT S2_RESULT
   S1_RESULT=$(mktemp)
   S2_RESULT=$(mktemp)
-  trap "rm -f '$S1_RESULT' '$S2_RESULT'" EXIT
+  # trap covers both tmpfile cleanup and any gpu lock held by this pipeline invocation.
+  # gpu_release is a no-op when GPU_LOCK_OWNER is unset, so safe to call unconditionally.
+  # subshell traps (below) cover locks acquired inside backgrounded stages.
+  trap "rm -f '$S1_RESULT' '$S2_RESULT'; gpu_release" EXIT SIGINT SIGTERM
 
   # --- stage 1: whisper ---
   if [[ "$S1_SKIP" = true ]]; then
     echo "[pipeline] stage 1: skipped (output exists)"
     update_status 1 "whisper" "done" "0"
-    echo "0 0 0 0" > "$S1_RESULT"
+    echo "0 0 0 0" >"$S1_RESULT"
   else
     echo "[pipeline] stage 1/4: whisper transcription (model=$MODEL)"
     update_status 1 "whisper" "running"
     (
+      # transport boundary: SET gpu_lock <owner> NX EX 1200 before docker-run
+      # cleanup contract: trap releases lock on any exit from this subshell,
+      # including SIGINT/SIGTERM forwarded by the parent's wait builtin
+      trap 'gpu_release' EXIT SIGINT SIGTERM
+      if ! gpu_acquire "whisper"; then
+        echo "[pipeline] error: could not acquire gpu_lock for whisper stage" >&2
+        sns=$(now_ns)
+        echo "1 0 $sns $(now_ns)" >"$S1_RESULT"
+        exit 1
+      fi
       s=$(now_s)
       sns=$(now_ns)
       AUDIO_FILE=$(ls -t "${VIDEO_DIR}/audio/${BASE}"*.wav 2>/dev/null | head -1)
       if [ -z "$AUDIO_FILE" ]; then
         echo "[pipeline] error: no audio file found for base=$BASE" >&2
-        echo "1 0 $sns $(now_ns)" > "$S1_RESULT"
+        echo "1 0 $sns $(now_ns)" >"$S1_RESULT"
         exit 1
       fi
       timeout "$TIMEOUT_STAGE1" docker run --rm \
@@ -426,7 +561,8 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
         2>&1
       rc=$?
       e=$(now_s)
-      echo "$rc $((e - s)) $sns $(now_ns)" > "$S1_RESULT"
+      # gpu_release called by EXIT trap above after rc is written
+      echo "$rc $((e - s)) $sns $(now_ns)" >"$S1_RESULT"
       exit $rc
     ) &
     local PID1=$!
@@ -436,11 +572,22 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
   if [[ "$S2_SKIP" = true ]]; then
     echo "[pipeline] stage 2: skipped (output exists)"
     update_status 2 "vision" "done" "0"
-    echo "0 0 0 0" > "$S2_RESULT"
+    echo "0 0 0 0" >"$S2_RESULT"
   else
     echo "[pipeline] stage 2/4: vision (Instella-VL-1B)"
     update_status 2 "vision" "running"
     (
+      # transport boundary: SET gpu_lock <owner> NX EX 1200 before docker-run
+      # vision acquires after whisper releases — stages are backgrounded in parallel
+      # but the lock serializes actual GPU use. whisper PID1 holds the lock first;
+      # vision will backoff and retry up to 62s total before failing.
+      trap 'gpu_release' EXIT SIGINT SIGTERM
+      if ! gpu_acquire "vision"; then
+        echo "[pipeline] error: could not acquire gpu_lock for vision stage" >&2
+        sns=$(now_ns)
+        echo "1 0 $sns $(now_ns)" >"$S2_RESULT"
+        exit 1
+      fi
       s=$(now_s)
       sns=$(now_ns)
       timeout "$TIMEOUT_STAGE2" docker run --rm \
@@ -457,7 +604,8 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
         2>&1
       rc=$?
       e=$(now_s)
-      echo "$rc $((e - s)) $sns $(now_ns)" > "$S2_RESULT"
+      # gpu_release called by EXIT trap above after rc is written
+      echo "$rc $((e - s)) $sns $(now_ns)" >"$S2_RESULT"
       exit $rc
     ) &
     local PID2=$!
@@ -470,7 +618,12 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
     wait "$PID1" || FAIL=1
   fi
   local S1_RC S1_ELAPSED S1_SNS S1_ENS
-  read -r S1_RC S1_ELAPSED S1_SNS S1_ENS < "$S1_RESULT" 2>/dev/null || { S1_RC=1; S1_ELAPSED=0; S1_SNS=0; S1_ENS=0; }
+  read -r S1_RC S1_ELAPSED S1_SNS S1_ENS <"$S1_RESULT" 2>/dev/null || {
+    S1_RC=1
+    S1_ELAPSED=0
+    S1_SNS=0
+    S1_ENS=0
+  }
 
   if [[ "$S1_SKIP" = false ]]; then
     if [[ "$S1_RC" == "0" ]]; then
@@ -488,7 +641,12 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
     wait "$PID2" || FAIL=1
   fi
   local S2_RC S2_ELAPSED S2_SNS S2_ENS
-  read -r S2_RC S2_ELAPSED S2_SNS S2_ENS < "$S2_RESULT" 2>/dev/null || { S2_RC=1; S2_ELAPSED=0; S2_SNS=0; S2_ENS=0; }
+  read -r S2_RC S2_ELAPSED S2_SNS S2_ENS <"$S2_RESULT" 2>/dev/null || {
+    S2_RC=1
+    S2_ELAPSED=0
+    S2_SNS=0
+    S2_ENS=0
+  }
 
   if [[ "$S2_SKIP" = false ]]; then
     if [[ "$S2_RC" == "0" ]]; then
@@ -612,7 +770,7 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
     local TIGHT_N_START TIGHT_N_START_NS
     TIGHT_N_START=$(now_s)
     TIGHT_N_START_NS=$(now_ns)
-    timeout 120 python3 "$PROJECT_DIR/scripts/tighten.py" narrative "$NARR_FILE" 2>&1 || \
+    timeout 120 python3 "$PROJECT_DIR/scripts/tighten.py" narrative "$NARR_FILE" 2>&1 ||
       echo "[pipeline] narrative tightening failed (non-fatal)"
     local TIGHT_N_ELAPSED=$(($(now_s) - TIGHT_N_START))
     echo "[pipeline] tighten narrative done (${TIGHT_N_ELAPSED}s)"
@@ -654,7 +812,7 @@ if [[ -n "$BATCH_FILE" ]]; then
       [[ -z "$line" ]] && continue
       do_dry_run "$line" "$MODEL"
       echo ""
-    done < "$BATCH_FILE"
+    done <"$BATCH_FILE"
     exit 0
   fi
 
