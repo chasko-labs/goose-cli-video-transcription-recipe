@@ -107,11 +107,11 @@ send_trace() {
 # transport boundary:
 #   key:     gpu_lock
 #   value:   <pid>-<hostname>-<stage>  (owner_id — used for compare-and-delete)
-#   acquire: SET gpu_lock <owner_id> NX EX 1200
+#   acquire: SET gpu_lock <owner_id> NX EX <ttl>
 #            NX = only set if absent (mutex)
-#            EX 1200 = orphan backstop; TTL > longest stage (TIMEOUT_STAGE1=900s,
-#                      TIMEOUT_STAGE2=600s). DEL on clean exit is load-bearing;
-#                      TTL is last-resort only.
+#            ttl = per-stage orphan backstop passed to gpu_acquire (default 10800).
+#            stage 0 fallback (whisper+download) observed at 7170s; vision at ~900s.
+#            DEL on clean exit is load-bearing; TTL is last-resort only.
 #   release: GET gpu_lock → compare to owner_id → DEL only if match
 #            prevents a ttl-expired-then-reacquired race from releasing a new
 #            owner's lock. no lua required: a single pid can only own one stage
@@ -136,13 +136,15 @@ valkey_cmd() {
   docker exec "$VALKEY_CONTAINER" valkey-cli "$@" 2>/dev/null
 }
 
-# gpu_acquire <stage>
-#   sets gpu_lock to "<pid>-<hostname>-<stage>" with NX EX 1200
+# gpu_acquire <stage> [ttl]
+#   sets gpu_lock to "<pid>-<hostname>-<stage>" with NX EX <ttl>
+#   ttl defaults to 10800 (3h) — callers should pass a stage-appropriate value
 #   retries with exponential backoff (base 2s, max 5 attempts)
 #   on success: exports GPU_LOCK_OWNER for use by gpu_release
 #   on failure: prints actionable error, returns 1
 gpu_acquire() {
   local stage="$1"
+  local ttl="${2:-10800}"
   local owner
   owner="$$-$(hostname -s)-${stage}"
   local delay=2
@@ -151,7 +153,7 @@ gpu_acquire() {
 
   while ((attempt < max_attempts)); do
     local result
-    result=$(valkey_cmd SET gpu_lock "$owner" NX EX 1200)
+    result=$(valkey_cmd SET gpu_lock "$owner" NX EX "$ttl")
     if [[ "$result" == "OK" ]]; then
       echo "[gpu-lock] acquired: owner=$owner"
       GPU_LOCK_OWNER="$owner"
@@ -389,7 +391,7 @@ except Exception:
       # this path runs in the main shell (not a subshell), so the outer EXIT trap
       # on run_pipeline() covers release if the function returns early or the
       # process is killed. gpu_release is idempotent when GPU_LOCK_OWNER is unset.
-      if ! gpu_acquire "fallback"; then
+      if ! gpu_acquire "fallback" 10800; then
         echo "[pipeline] error: could not acquire gpu_lock for stage-0 fallback" >&2
         S0_END=$(now_s)
         S0_ELAPSED=$((S0_END - S0_START))
@@ -529,7 +531,7 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
       # cleanup contract: trap releases lock on any exit from this subshell,
       # including SIGINT/SIGTERM forwarded by the parent's wait builtin
       trap 'gpu_release' EXIT SIGINT SIGTERM
-      if ! gpu_acquire "whisper"; then
+      if ! gpu_acquire "whisper" 3600; then
         echo "[pipeline] error: could not acquire gpu_lock for whisper stage" >&2
         sns=$(now_ns)
         echo "1 0 $sns $(now_ns)" >"$S1_RESULT"
@@ -582,7 +584,7 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
       # but the lock serializes actual GPU use. whisper PID1 holds the lock first;
       # vision will backoff and retry up to 62s total before failing.
       trap 'gpu_release' EXIT SIGINT SIGTERM
-      if ! gpu_acquire "vision"; then
+      if ! gpu_acquire "vision" 3600; then
         echo "[pipeline] error: could not acquire gpu_lock for vision stage" >&2
         sns=$(now_ns)
         echo "1 0 $sns $(now_ns)" >"$S2_RESULT"
