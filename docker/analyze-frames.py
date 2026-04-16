@@ -12,6 +12,7 @@ Dependency conflict resolution:
   But modeling_instellavl.py imports apply_chunking_to_forward removed in transformers 4.45.
   Patch: re-inject the function into transformers.modeling_utils before model load.
 """
+
 import sys
 import os
 import json
@@ -24,7 +25,8 @@ from PIL import Image
 # patch functions removed/moved from transformers.modeling_utils in 4.45+
 # modeling_instellavl.py imports them from the old location
 
-if not hasattr(_tmu, 'apply_chunking_to_forward'):
+if not hasattr(_tmu, "apply_chunking_to_forward"):
+
     def _apply_chunking_to_forward(forward_fn, chunk_size, chunk_dim, *input_tensors):
         if chunk_size > 0:
             tensor_shape = input_tensors[0].shape[chunk_dim]
@@ -38,6 +40,7 @@ if not hasattr(_tmu, 'apply_chunking_to_forward'):
             output_chunks = tuple(forward_fn(*grp) for grp in zip(*chunks))
             return torch.cat(output_chunks, dim=chunk_dim)
         return forward_fn(*input_tensors)
+
     _tmu.apply_chunking_to_forward = _apply_chunking_to_forward
 
 # find_pruneable_heads_and_indices + prune_linear_layer moved to pytorch_utils in 4.45+
@@ -46,9 +49,10 @@ try:
         find_pruneable_heads_and_indices,
         prune_linear_layer,
     )
-    if not hasattr(_tmu, 'find_pruneable_heads_and_indices'):
+
+    if not hasattr(_tmu, "find_pruneable_heads_and_indices"):
         _tmu.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
-    if not hasattr(_tmu, 'prune_linear_layer'):
+    if not hasattr(_tmu, "prune_linear_layer"):
         _tmu.prune_linear_layer = prune_linear_layer
 except ImportError:
     pass
@@ -63,6 +67,7 @@ MODEL_ID = os.environ.get("VISION_MODEL", "amd/Instella-VL-1B")
 
 def load_model():
     from transformers import AutoModelForCausalLM, AutoProcessor
+
     print(f"[vision] loading {MODEL_ID}", flush=True)
     processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
@@ -136,21 +141,26 @@ def main():
     for i, frame_path in enumerate(frames):
         frame_name = Path(frame_path).name
         frame_idx = int(frame_name.split("_frame_")[1].split(".")[0])
-        print(f"[vision] {i+1}/{len(frames)}: {frame_name}", flush=True)
+        print(f"[vision] {i + 1}/{len(frames)}: {frame_name}", flush=True)
         description = analyze_frame(model, processor, clip_processor, frame_path)
-        results.append({
-            "frame": frame_name,
-            "frame_index": frame_idx,
-            "path": frame_path,
-            "description": description,
-        })
+        results.append(
+            {
+                "frame": frame_name,
+                "frame_index": frame_idx,
+                "path": frame_path,
+                "description": description,
+            }
+        )
 
     os.makedirs(output_dir, exist_ok=True)
     out_path = f"{output_dir}/{base_prefix}-frame-analysis.json"
     with open(out_path, "w") as f:
-        json.dump({"base": base_prefix, "model": MODEL_ID, "frames": results}, f, indent=2)
+        json.dump(
+            {"base": base_prefix, "model": MODEL_ID, "frames": results}, f, indent=2
+        )
 
     print(f"[vision] done — {len(results)} frames → {out_path}")
+    os._exit(0)  # skip pytorch/rocm cleanup crash during interpreter shutdown
 
 
 if __name__ == "__main__":
