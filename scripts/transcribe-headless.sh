@@ -269,6 +269,22 @@ run_pipeline() {
   cd "$PROJECT_DIR"
   mkdir -p "$VIDEO_DIR"/{videos,audio,frames,transcripts} "$NARRATIVES_DIR"
 
+  # stamp whisper_model into status.json so downstream tooling (route-narrative)
+  # can read it from a single source of truth
+  python3 - "$VIDEO_DIR/status.json" "$MODEL" <<'PYEOF'
+import sys, json, os
+path, model = sys.argv[1], sys.argv[2]
+try:
+    data = json.loads(open(path).read())
+except Exception:
+    data = {}
+data["whisper_model"] = model
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.rename(tmp, path)
+PYEOF
+
   # build images if missing
   if ! docker image inspect "$WHISPER_IMAGE" >/dev/null 2>&1; then
     echo "[pipeline] building whisper container (first run)"
@@ -777,6 +793,11 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
     local TIGHT_N_ELAPSED=$(($(now_s) - TIGHT_N_START))
     echo "[pipeline] tighten narrative done (${TIGHT_N_ELAPSED}s)"
     send_trace "tighten-narrative" "$TIGHT_N_START_NS" "$(now_ns)" "ok" "type=narrative"
+
+    # route narrative to qdrant gander-knowledge (non-fatal)
+    echo "[pipeline] routing narrative to qdrant gander-knowledge"
+    timeout 120 python3 "$PROJECT_DIR/scripts/route-narrative.py" "$NARR_FILE" "$VIDEO_DIR" 2>&1 ||
+      echo "[pipeline] narrative routing failed (non-fatal)"
   fi
 
   # =========================================================================
