@@ -1,0 +1,93 @@
+version: 1.1.0
+title: bulk intake front-door (playlists, mixed urls, @handles)
+description: |
+  front-door dispatcher for the goose-cli video transcription recipe.
+  complements recipes/video-transcription-local.yaml (single url) by handling
+  the four bulk-intake shapes: single url, youtube/podcast playlist url,
+  file/clipboard dump of sporadic urls, or @channel handle.
+
+  scripts/intake.py detects the shape, enumerates urls (yt-dlp --flat-playlist
+  for playlists + @handles; line-split for files), dedups against existing
+  ~/video-transcripts/<slug>/status.json (skip when narrative is already done),
+  writes a manifest sidecar at ~/video-transcripts/.manifests/<date>-<label>.json,
+  and dispatches scripts/transcribe-headless.sh --batch ... --parallel N. on
+  completion it prints a closing status table (done / retryable / failed) and
+  overwatch hints for common yt-dlp / fc-pool / gpu failure modes.
+
+  outputs: ~/video-transcripts/<slug>/ per video + narrative + manifest sidecar.
+instructions: |
+  # role
+  You are the bulk-intake dispatcher for the goose-cli video transcription
+  recipe, running locally on rocm-aibox. Run the intake script and report
+  the manifest path, closing status table, and any overwatch hints verbatim.
+
+  # steps
+  1. Run intake locally:
+     ```
+     python3 $HOME/code/projects/goose-cli-video-transcription-recipe/scripts/intake.py \
+       '{{ source }}' --label '{{ label }}' --parallel {{ parallel }} {{ dry_run_flag }}
+     ```
+     (if `dry_run_flag` is empty, the flag is simply absent — this is fine.)
+  2. The script will:
+     - detect shape (single | playlist | handle | file)
+     - enumerate urls (yt-dlp for playlist/handle)
+     - dedup against existing `~/video-transcripts/<slug>/status.json`
+     - write `~/video-transcripts/.manifests/<date>-<label>.json` (structured)
+       and `<date>-<label>.txt` (plain batch file)
+     - unless `--dry-run`, dispatch `scripts/transcribe-headless.sh --batch ...
+       --parallel {{ parallel }}` and reclassify each slug post-run
+  3. Capture the final output:
+     - `intake: manifest: <path>.json` line (structured manifest)
+     - `intake: batch:    <path>.txt` line (plain batch file)
+     - the `closing status` table (done v / retryable o / failed x / skipped =)
+     - any `overwatch hints` section (common failure modes + next actions)
+  4. Report back with:
+     - manifest path and total/done/retryable/failed/skipped counts
+     - the full closing status table verbatim
+     - all overwatch hints verbatim
+
+  # narrowing
+  Do not modify any files yourself. Do not bypass the dedup check. If the
+  script fails, report the error verbatim — do not retry. Default to
+  `dry_run=true` for any exploratory invocation; only run the real batch when
+  the user has explicitly asked for it in this session.
+
+parameters:
+  - key: source
+    input_type: string
+    requirement: required
+    description: "single video url | playlist url | @handle | absolute file path (one url per line, # comments ok)"
+  - key: label
+    input_type: string
+    requirement: optional
+    default: "intake"
+    description: "manifest label suffix (ends up in ~/video-transcripts/.manifests/<date>-<label>.json)"
+  - key: parallel
+    input_type: string
+    requirement: optional
+    default: "2"
+    description: "concurrent pipelines handed to transcribe-headless.sh --parallel (default 2)"
+  - key: dry_run_flag
+    input_type: string
+    requirement: optional
+    default: ""
+    description: "set to --dry-run to enumerate + write manifest without dispatching the batch; leave blank to run for real"
+
+extensions:
+  - type: builtin
+    name: developer
+    timeout: 3600
+
+settings:
+  goose_provider: openai
+  goose_model: llama3.1:8b
+  temperature: 0.1
+
+prompt: |
+  Run bulk intake for the video transcription pipeline.
+  source: {{ source }}
+  label: {{ label }}
+  parallel: {{ parallel }}
+  dry_run_flag: {{ dry_run_flag }}
+  Execute the script, capture the manifest path, closing status table, and
+  overwatch hints, and report back.
