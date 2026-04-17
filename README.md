@@ -25,6 +25,14 @@ stage 4: narrative         ollama llama3.1:8b weaves transcript + visuals into p
 | jaeger | :4318 (otlp), :16686 (ui) | distributed tracing — one trace per pipeline run |
 | ollama | :11434 | narrative generation (llama3.1:8b) |
 
+## goose-session wiring
+
+the sprint-1 recipes (`video-transcription-local.yaml`, `goose-cli-tutor.yaml`, `tidy.yaml`) run inside the dockerized gander goose-cli runtime. the container mounts this repo and `~/video-transcripts/` at `/home/goose/...` so `$HOME/code/projects/...` script paths and `~/video-transcripts/` data paths resolve unchanged.
+
+bind mounts live in `~/code/heraldstack/gander-goose-cli/docker-compose.yml` under the `goose` service volumes block. future cross-repo recipes follow the two rules documented in `~/code/heraldstack/gander-goose-cli/KNOWLEDGE.md` ("Cross-Repo Recipes (Mount Pattern)"): (a) script repos mount at `/home/goose/code/.../`, (b) data dirs mount at `/home/goose/<dir>/`.
+
+to open a goose-session scoped to this data dir: `cd ~/video-transcripts && goose-session`. recipes resolve via the `.goose/recipes/` symlink; hints load from `.goosehints`.
+
 ## usage
 
 ```bash
