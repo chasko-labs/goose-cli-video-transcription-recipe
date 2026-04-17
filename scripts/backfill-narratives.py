@@ -96,14 +96,20 @@ def video_dir_from_narrative(narr_path: Path, transcripts_root: Path) -> Path | 
         # so video-dir is two parents up
         if combined.parent.name == "transcripts":
             vd = combined.parent.parent
-            if vd.is_dir():
+            if vd.is_dir() and (vd / "transcripts" / "metadata.json").is_file():
                 return vd
-        # if the referenced dir was renamed, search by embedded video id
+            # dir exists but lacks metadata.json — fall through to ID search
+        # if the referenced dir was renamed or lacks metadata, search by embedded video id
         vid_id = _video_id_from_combined(combined)
         if vid_id:
             found = _find_video_dir_by_id(vid_id, transcripts_root)
             if found:
                 return found
+        # last resort: return the dir even if metadata is absent
+        if combined.parent.name == "transcripts":
+            vd = combined.parent.parent
+            if vd.is_dir():
+                return vd
     # fallback: guess from slug by looking at transcripts_root
     stem = narr_path.stem
     candidate = transcripts_root / stem
