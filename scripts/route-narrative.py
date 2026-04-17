@@ -24,6 +24,13 @@ embedding:
 exit codes:
   0 ok (or skipped with warning) — must be non-fatal to pipeline
   2 bad usage
+
+observability:
+  per-invocation structured log on stdout (jsonl), human warnings on stderr
+  aggregator (last 100 invocations failure rate):
+    tail -n 1000 output.log | grep '"event":"route_narrative"' | tail -n 100 | jq -s 'map(select(.qdrant_status=="fail")) | length / 100 * 100'
+  live counters:
+    docker exec heraldstack-valkey valkey-cli MGET gander:route:success gander:route:fail
 """
 from __future__ import annotations
 
@@ -31,7 +38,9 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -72,6 +81,34 @@ NAMESPACE = uuid.UUID("c7b2f6e8-6b0a-4e0c-9f1f-0e3a4d2b6a1a")
 
 def log(msg: str) -> None:
     print(f"[route-narrative] {msg}", file=sys.stderr, flush=True)
+
+
+def emit_structured_log(event: str, slug: str, chunk_count: int, qdrant_status: str, ms: int, error: str | None = None) -> None:
+    """emit one-line jsonl structured log to stdout for downstream aggregation."""
+    record = {
+        "event": event,
+        "slug": slug,
+        "chunk_count": chunk_count,
+        "qdrant_status": qdrant_status,
+        "ms": ms,
+    }
+    if error:
+        record["error"] = error
+    print(json.dumps(record), flush=True)
+
+
+def incr_valkey_counter(key: str) -> None:
+    """increment a valkey counter via docker exec; non-fatal if valkey is down."""
+    try:
+        subprocess.run(
+            ["docker", "exec", "heraldstack-valkey", "valkey-cli", "INCR", key],
+            check=False,
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        # valkey unavailable or docker exec failed — silent, non-fatal
+        pass
 
 
 def read_frontmatter(md_text: str) -> tuple[dict, str]:
@@ -267,6 +304,7 @@ def upsert_points(points: list[dict]) -> dict:
 
 
 def route_narrative(narrative_path: Path, video_dir: Path) -> dict:
+    start_ms = int(time.time() * 1000)
     md = narrative_path.read_text()
     meta, body = read_frontmatter(md)
 
@@ -287,36 +325,49 @@ def route_narrative(narrative_path: Path, video_dir: Path) -> dict:
     chunks = chunk_narrative(body)
     if not chunks:
         log(f"skip: no chunks produced for {narrative_path.name}")
+        ms = int(time.time() * 1000) - start_ms
+        emit_structured_log("route_narrative", slug, 0, "ok", ms)
+        incr_valkey_counter("gander:route:success")
         return {"slug": slug, "chunks": 0, "skipped": True}
 
     log(f"slug={slug} chunks={len(chunks)} source={source} dur={duration_s}s")
 
-    vectors = embed_texts(chunks)
+    try:
+        vectors = embed_texts(chunks)
 
-    points = []
-    for i, (text, vec) in enumerate(zip(chunks, vectors)):
-        pid = str(uuid.uuid5(NAMESPACE, f"{slug}:{i}"))
-        points.append({
-            "id": pid,
-            "vector": {VECTOR_NAME: vec},
-            "payload": {
-                "slug": slug,
-                "chunk_index": i,
-                "chunk_count": len(chunks),
-                "text": text,
-                "title": meta.get("title", ""),
-                "source": source,
-                "date_transcribed": date_transcribed,
-                "duration_s": duration_s,
-                "whisper_model": whisper_model,
-                "persona_interests": [],
-            },
-        })
+        points = []
+        for i, (text, vec) in enumerate(zip(chunks, vectors)):
+            pid = str(uuid.uuid5(NAMESPACE, f"{slug}:{i}"))
+            points.append({
+                "id": pid,
+                "vector": {VECTOR_NAME: vec},
+                "payload": {
+                    "slug": slug,
+                    "chunk_index": i,
+                    "chunk_count": len(chunks),
+                    "text": text,
+                    "title": meta.get("title", ""),
+                    "source": source,
+                    "date_transcribed": date_transcribed,
+                    "duration_s": duration_s,
+                    "whisper_model": whisper_model,
+                    "persona_interests": [],
+                },
+            })
 
-    # idempotency: delete then upsert
-    delete_by_slug(slug)
-    upsert_points(points)
-    return {"slug": slug, "chunks": len(chunks), "skipped": False}
+        # idempotency: delete then upsert
+        delete_by_slug(slug)
+        upsert_points(points)
+        ms = int(time.time() * 1000) - start_ms
+        emit_structured_log("route_narrative", slug, len(chunks), "ok", ms)
+        incr_valkey_counter("gander:route:success")
+        return {"slug": slug, "chunks": len(chunks), "skipped": False}
+    except Exception as e:
+        ms = int(time.time() * 1000) - start_ms
+        error_msg = f"{type(e).__name__}: {str(e)[:100]}"
+        emit_structured_log("route_narrative", slug, len(chunks), "fail", ms, error_msg)
+        incr_valkey_counter("gander:route:fail")
+        raise
 
 
 def main() -> int:
@@ -336,7 +387,8 @@ def main() -> int:
         result = route_narrative(args.narrative, args.video_dir)
     except Exception as e:
         log(f"error: {e}")
-        return 1
+        # still return 0 to preserve non-fatal posture in pipeline hook
+        return 0
 
     log(f"done: {result}")
     return 0

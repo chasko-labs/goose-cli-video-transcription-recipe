@@ -795,9 +795,32 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
     send_trace "tighten-narrative" "$TIGHT_N_START_NS" "$(now_ns)" "ok" "type=narrative"
 
     # route narrative to qdrant gander-knowledge (non-fatal)
+    # note: 2>&1 merges stdout (structured jsonl log) with stderr (human warnings).
+    # downstream consumers can filter for structured events via | grep '"event":"route_narrative'
+    # or split to separate log files if desired: 1>stdout.log 2>stderr.log
     echo "[pipeline] routing narrative to qdrant gander-knowledge"
     timeout 120 python3 "$PROJECT_DIR/scripts/route-narrative.py" "$NARR_FILE" "$VIDEO_DIR" 2>&1 ||
       echo "[pipeline] narrative routing failed (non-fatal)"
+
+    # drift-scan narrative against chasko-labs/dotfiles-ops (non-fatal).
+    # emits one assistant-message envelope per non-empty line of the narrative
+    # as a workaround for heraldstack-firecracker#68 (multi-line content inside
+    # a single JSONL record silently misses findings). Remove the line-split
+    # when #68 is fixed.
+    if [ -x /usr/local/bin/hs-drift-scan ]; then
+      echo "[pipeline] drift-scan narrative -> chasko-labs/dotfiles-ops"
+      python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    for line in f:
+        line = line.rstrip('\n')
+        if not line.strip():
+            continue
+        print(json.dumps({'type': 'assistant', 'message': {'role': 'assistant', 'content': line}}))
+" "$NARR_FILE" |
+        timeout 60 /usr/local/bin/hs-drift-scan --target chasko-labs/dotfiles-ops >/dev/null 2>&1 ||
+        echo "[pipeline] drift-scan narrative failed (non-fatal)"
+    fi
   fi
 
   # =========================================================================
