@@ -32,12 +32,20 @@ NARRATIVE_MODEL = os.environ.get("NARRATIVE_MODEL", "llama3.1:8b")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 
 
-def slugify(text: str, max_len: int = 60) -> str:
+def slugify(text: str, max_len: int = 80) -> str:
     text = text.lower().strip()
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_]+", "-", text)
     text = re.sub(r"-+", "-", text).strip("-")
     return text[:max_len]
+
+
+_DATE_URL_RE = re.compile(r"^\d{8}[_-]\d{6}[_-]")
+
+
+def _title_is_url_derived(title: str) -> bool:
+    """true when title looks like a timestamp+url slug (not human-readable)."""
+    return bool(_DATE_URL_RE.match(title.strip()))
 
 
 def find_latest_combined(transcripts_dir: Path) -> Path | None:
@@ -142,13 +150,21 @@ def main():
         sys.exit(1)
 
     narratives_dir.mkdir(parents=True, exist_ok=True)
+
+    # prefer content title; fall back to date-stamp when title is URL-derived or too short
     slug = slugify(title)
+    if _title_is_url_derived(title) or len(slug) < 8:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        slug = ts
+        # overwrite title in header with date-stamp so H1 doesn't expose a URL slug
+        title = ts
+
     out_path = narratives_dir / f"{slug}.md"
 
-    # if slug already exists from a prior run, append timestamp to avoid overwrite
+    # collision: append first 6 chars of a url-derived id to avoid silent overwrite
     if out_path.exists():
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_path = narratives_dir / f"{slug}-{ts}.md"
+        url_id = re.sub(r"[^A-Za-z0-9]", "", meta.get("id") or meta.get("webpage_url", slug))[-6:].lower()
+        out_path = narratives_dir / f"{slug}-{url_id}.md"
 
     header = f"# {title}\n\n"
     header += f"- source: {meta.get('webpage_url', meta.get('original_url', ''))}\n"
