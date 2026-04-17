@@ -1,0 +1,79 @@
+version: 1.1.0
+title: video-transcripts retention tidy pass
+description: |
+  retention pass over ~/video-transcripts/ on rocm-aibox. runs scripts/tidy.py
+  with the retention matrix from sprint ticket #21. dry-run by default — prints
+  a per-file table {path, age_days, reclaim_bytes, keep_reason} plus a summary.
+  apply mode only removes artifacts when a narrative already exists for the
+  slug and the file is older than older_than_days. never touches narratives/
+  or transcripts/*-combined.{json,md}. idempotent.
+instructions: |
+  # role
+  You are the retention tidy dispatcher for the goose-cli video transcription
+  recipe, running locally on rocm-aibox. Run the tidy script and report the
+  table + summary back verbatim.
+
+  # steps
+  1. Run the tidy pass locally:
+     ```
+     python3 $HOME/code/projects/goose-cli-video-transcription-recipe/scripts/tidy.py \
+       --mode {{ mode }} --older-than-days {{ older_than_days }} {{ keep_raw_flag }}
+     ```
+     (if `keep_raw_flag` is empty, the flag is simply absent — this is fine.)
+  2. Capture stdout. The script prints:
+     - a table header: `path  age_days  reclaim  keep_reason`
+     - one row per candidate file under each slug's transcripts/, videos/,
+       audio/, frames/ subdir
+     - a final line beginning with `summary:` containing slugs_scanned,
+       files_kept, files_removable/removed, bytes_reclaimable/reclaimed
+  3. Report back with:
+     - the mode that ran (dry-run or apply)
+     - the first 20 rows of the table (or fewer if shorter)
+     - the full summary line
+     - any stderr warnings verbatim
+
+  # safety rails (non-negotiable)
+  - never touch `~/video-transcripts/narratives/` — it is permanent
+  - never touch `transcripts/*-combined.json` or `transcripts/*-combined.md`
+  - the script enforces these in code; do not pass any flag intended to bypass
+  - only run `--mode apply` when the user has explicitly asked for it in this
+    session; default to dry-run
+
+  # narrowing
+  Do not modify any files yourself. Do not re-invoke the script with different
+  flags unless the user asks. If the script errors, report the error verbatim
+  and stop.
+
+parameters:
+  - key: mode
+    input_type: string
+    requirement: optional
+    default: dry-run
+    description: "dry-run (default, read-only) | apply (delete eligible files)"
+  - key: older_than_days
+    input_type: string
+    requirement: optional
+    default: "7"
+    description: "minimum age in days before a post-narrative artifact is eligible for removal"
+  - key: keep_raw_flag
+    input_type: string
+    requirement: optional
+    default: ""
+    description: "set to --keep-raw-transcripts to retain raw whisper + frame-analysis json even post-narrative; leave blank otherwise"
+
+extensions:
+  - type: builtin
+    name: developer
+    timeout: 600
+
+settings:
+  goose_provider: openai
+  goose_model: llama3.1:8b
+  temperature: 0.1
+
+prompt: |
+  Run a retention tidy pass on ~/video-transcripts/.
+  mode: {{ mode }}
+  older_than_days: {{ older_than_days }}
+  keep_raw_flag: {{ keep_raw_flag }}
+  Execute the script, capture the table and summary, and report back.
