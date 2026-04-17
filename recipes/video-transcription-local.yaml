@@ -1,0 +1,88 @@
+version: 1.1.0
+title: video + podcast transcription pipeline (rocm-aibox local)
+description: |
+  rocm-aibox-direct variant of video-transcription.yaml — invokes
+  scripts/transcribe-headless.sh on the local host, no ssh transport.
+  use this when sitting at rocm-aibox. for the mac mini → rocm-aibox
+  flow, use recipes/video-transcription.yaml.
+
+  same 5-stage pipeline: media-extract (fc-pool microvm or docker
+  fallback) → whisper gpu transcription → instella-vl-1b keyframe
+  analysis → tightener → merge → ollama narrative → narrative
+  tightener. supports video urls, podcast rss episode urls, direct
+  audio files. auto-detects audio-only.
+  outputs: ~/video-transcripts/<url-slug>/
+instructions: |
+  # role
+  You are the pipeline dispatcher for the goose-cli video transcription
+  recipe, running locally on rocm-aibox. Run the pipeline script and
+  report results.
+
+  # steps
+  1. Run the pipeline locally:
+     ```
+     bash $HOME/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh '{{ video_url }}' {{ model_size }} {{ extra_flags }}
+     ```
+  2. Wait for it to complete. Progress logs:
+     - `[pipeline] stage 0/4: media-extract` — yt-dlp download + ffmpeg audio/frames
+     - `[pipeline] stage 1/4: whisper` — gpu transcription
+     - `[pipeline] stage 2/4: vision` — instella-vl-1b frame analysis (skipped if audio-only)
+     - `[pipeline] tightening transcript` — regex filler removal
+     - `[pipeline] stage 3/4: merge` — timestamp correlation, combined doc
+     - `[pipeline] stage 4/4: narrative` — ollama narrative generation
+     - `[pipeline] tightening narrative` — ollama prose tightening
+  3. Capture the final output lines:
+     - `[pipeline] combined:   ~/video-transcripts/<slug>/transcripts/<base>-combined.md`
+     - `[pipeline] narrative:  ~/video-transcripts/narratives/<content-title>.md`
+  4. Report back with:
+     - the per-video slug and base prefix
+     - full path to combined.md and the narrative
+     - whether audio-only was detected
+     - brief summary of what the content covered (from the narrative)
+
+  # batch mode
+  For multiple URLs, create a file with one URL per line and use:
+  ```
+  bash $HOME/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh --batch /path/to/urls.txt --parallel 2
+  ```
+  Report the manifest path and summary table.
+
+  # monitoring
+  - poll status: `cat ~/video-transcripts/<slug>/status.json`
+  - view traces: http://localhost:16686 (jaeger ui)
+
+  # narrowing
+  Do not modify any files. Do not re-run stages that already completed (resume is automatic).
+  If the script fails at a stage, report the error verbatim — do not retry.
+
+parameters:
+  - key: video_url
+    input_type: string
+    requirement: required
+    description: URL of the video or podcast to transcribe (youtube, direct mp3, any yt-dlp source)
+  - key: model_size
+    input_type: string
+    requirement: optional
+    default: medium
+    description: "whisper model size: tiny | base | small | medium | large"
+  - key: extra_flags
+    input_type: string
+    requirement: optional
+    default: ""
+    description: "additional flags: --force --dry-run --audio-only"
+
+extensions:
+  - type: builtin
+    name: developer
+    timeout: 1800
+
+settings:
+  goose_provider: openai
+  goose_model: llama3.1:8b
+  temperature: 0.1
+
+prompt: |
+  Transcribe and analyze this content: {{ video_url }}
+  Whisper model: {{ model_size }}
+  Extra flags: {{ extra_flags }}
+  Run the full pipeline and report the output paths and a brief summary.
