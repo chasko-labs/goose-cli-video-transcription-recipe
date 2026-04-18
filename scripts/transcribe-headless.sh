@@ -136,22 +136,23 @@ valkey_cmd() {
   docker exec "$VALKEY_CONTAINER" valkey-cli "$@" 2>/dev/null
 }
 
-# gpu_acquire <stage> [ttl]
+# gpu_acquire <stage> [ttl [max_wait]]
 #   sets gpu_lock to "<pid>-<hostname>-<stage>" with NX EX <ttl>
 #   ttl defaults to 10800 (3h) — callers should pass a stage-appropriate value
-#   retries with exponential backoff (base 2s, max 5 attempts)
+#   max_wait: total seconds to keep retrying (default 3600); exponential backoff capped at 60s
 #   on success: exports GPU_LOCK_OWNER for use by gpu_release
 #   on failure: prints actionable error, returns 1
 gpu_acquire() {
   local stage="$1"
   local ttl="${2:-10800}"
+  local max_wait="${3:-3600}"
   local owner
   owner="$$-$(hostname -s)-${stage}"
   local delay=2
-  local max_attempts=5
   local attempt=0
+  local elapsed=0
 
-  while ((attempt < max_attempts)); do
+  while ((elapsed < max_wait)); do
     local result
     result=$(valkey_cmd SET gpu_lock "$owner" NX EX "$ttl")
     if [[ "$result" == "OK" ]]; then
@@ -162,15 +163,15 @@ gpu_acquire() {
     fi
     local held_by
     held_by=$(valkey_cmd GET gpu_lock 2>/dev/null || echo "unknown")
-    echo "[gpu-lock] lock held by '$held_by' — retry $((attempt + 1))/$max_attempts in ${delay}s"
+    echo "[gpu-lock] lock held by '$held_by' — retry $((attempt + 1)) in ${delay}s (${elapsed}/${max_wait}s elapsed)"
     sleep "$delay"
-    delay=$((delay * 2))
+    elapsed=$((elapsed + delay))
+    delay=$(( delay * 2 > 60 ? 60 : delay * 2 ))
     ((attempt++))
   done
 
-  echo "[gpu-lock] error: could not acquire gpu_lock after $max_attempts attempts" \
+  echo "[gpu-lock] error: could not acquire gpu_lock after ${max_wait}s" \
     "(last holder: $(valkey_cmd GET gpu_lock 2>/dev/null || echo 'unknown'))" >&2
-  echo "[gpu-lock] error: check for stale lock or increase TIMEOUT_STAGE1/TIMEOUT_STAGE2" >&2
   return 1
 }
 
