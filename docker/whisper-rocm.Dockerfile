@@ -6,7 +6,7 @@ WORKDIR /app
 # yt-dlp extracts audio, whisper transcribes, ffmpeg handles format conversion
 RUN pip install --no-cache-dir \
     openai-whisper \
-    yt-dlp \
+    "yt-dlp==2026.03.17" \
     && apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
