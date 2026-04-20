@@ -22,9 +22,9 @@ instructions: |
   the manifest path, closing status table, and any overwatch hints verbatim.
 
   # steps
-  1. Run intake locally:
+  1. Run intake locally — use this exact absolute path, do not guess or shorten it:
      ```
-     python3 $HOME/code/projects/goose-cli-video-transcription-recipe/scripts/intake.py \
+     python3 /home/bryanchasko/code/projects/goose-cli-video-transcription-recipe/scripts/intake.py \
        '{{ source }}' --label '{{ label }}' --parallel {{ parallel }} {{ dry_run_flag }}
      ```
      (if `dry_run_flag` is empty, the flag is simply absent — this is fine.)
@@ -56,7 +56,7 @@ parameters:
   - key: source
     input_type: string
     requirement: required
-    description: "single video url | playlist url | @handle | absolute file path (one url per line, # comments ok)"
+    description: "single video url | playlist url | @handle | absolute file path (one url per line, # comments ok) | .md file (urls extracted from markdown tables/links)"
   - key: label
     input_type: string
     requirement: optional
@@ -79,8 +79,8 @@ extensions:
     timeout: 3600
 
 settings:
-  goose_provider: openai
-  goose_model: llama3.1:8b
+  goose_provider: ollama
+  goose_model: mistral-nemo
   temperature: 0.1
 
 prompt: |

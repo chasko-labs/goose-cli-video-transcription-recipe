@@ -58,17 +58,17 @@ process_batch() {
       (
         local start end rc
         start=$(now_s)
+        mkdir -p "$DATA_DIR/$slug"
         # pre-stamp pending status before run_pipeline so verdict table distinguishes
         # never-started URLs from URLs that crashed before the first real stage stamp.
         # run_pipeline overwrites this on its first update_status call.
-        mkdir -p "$DATA_DIR/$slug"
         python3 -c "
 import json, sys
 json.dump({'stage': 'pending', 'status': 'pending', 'url': sys.argv[1]},
           open(sys.argv[2], 'w'), indent=2)
 " "$url" "$DATA_DIR/$slug/status.json" 2>/dev/null || true
-        run_pipeline "$url" "$model" >"$tmpdir/${i}.log" 2>&1
-        rc=$?
+        run_pipeline "$url" "$model" 2>&1 | tee "$DATA_DIR/$slug/run.log" >"$tmpdir/${i}.log"
+        rc=${PIPESTATUS[0]}
         end=$(now_s)
         local status_str="done"
         [[ $rc -ne 0 ]] && status_str="failed"
@@ -85,6 +85,7 @@ json.dump({
     'narrative_path': '$narr'
 }, open('$tmpdir/${i}.json', 'w'))
 "
+        # shellcheck disable=SC2086  # rc is an integer, no word-splitting risk
         exit $rc
       ) &
       pids+=($!)
@@ -92,14 +93,14 @@ json.dump({
     else
       local start end rc
       start=$(now_s)
-      # pre-stamp pending status before run_pipeline (mirrors parallel path above)
       mkdir -p "$DATA_DIR/$slug"
+      # pre-stamp pending status before run_pipeline (mirrors parallel path above)
       python3 -c "
 import json, sys
 json.dump({'stage': 'pending', 'status': 'pending', 'url': sys.argv[1]},
           open(sys.argv[2], 'w'), indent=2)
 " "$url" "$DATA_DIR/$slug/status.json" 2>/dev/null || true
-      run_pipeline "$url" "$model" 2>&1 | tee "$tmpdir/${i}.log"
+      run_pipeline "$url" "$model" 2>&1 | tee "$DATA_DIR/$slug/run.log" "$tmpdir/${i}.log" >/dev/null
       rc=${PIPESTATUS[0]}
       end=$(now_s)
       local status_str="done"
