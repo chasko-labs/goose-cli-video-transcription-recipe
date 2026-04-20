@@ -30,6 +30,7 @@ from datetime import datetime
 
 NARRATIVE_MODEL = os.environ.get("NARRATIVE_MODEL", "llama3.1:8b")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_TIMEOUT = int(os.environ.get("OLLAMA_TIMEOUT", "600"))
 
 
 def slugify(text: str, max_len: int = 80) -> str:
@@ -115,7 +116,7 @@ def call_ollama(prompt: str, model: str) -> str:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
         data = json.loads(resp.read())
         return data.get("response", "").strip()
 

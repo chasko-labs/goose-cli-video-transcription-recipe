@@ -681,11 +681,18 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
       # container name: deterministic per pid+stage — kill trap fires on timeout
       # so daemon does not keep the container running indefinitely after client kill.
       _S2_CNAME="whisper-$$-s2"
-      trap 'docker kill "'"$_S2_CNAME"'" 2>/dev/null; docker rm -f "'"$_S2_CNAME"'" 2>/dev/null; gpu_release' EXIT SIGINT SIGTERM
+      # sentinel flag: set to 1 after the normal result line is written (line ~711).
+      # the trap checks this to avoid overwriting a good result with the fallback line.
+      # format: "rc elapsed_s start_ns end_ns" — four fields, matches parent parse at line ~747.
+      # fallback: "1 0 0 0" (rc=1, zero counters) so parent read -r finds a well-formed line
+      # even when the subshell is SIGTERM'd before the docker run completes.
+      _S2_RESULT_WRITTEN=0
+      trap 'docker kill "'"$_S2_CNAME"'" 2>/dev/null; docker rm -f "'"$_S2_CNAME"'" 2>/dev/null; [[ "$_S2_RESULT_WRITTEN" -eq 0 ]] && echo "1 0 0 0" >'"$S2_RESULT"'; gpu_release' EXIT SIGINT SIGTERM
       if ! gpu_acquire "vision" 3600; then
         echo "[pipeline] error: could not acquire gpu_lock for vision stage" >&2
         sns=$(now_ns)
         echo "1 0 $sns $(now_ns)" >"$S2_RESULT"
+        _S2_RESULT_WRITTEN=1
         exit 1
       fi
       # free GPU memory held by any ollama models kept warm from prior narrative/cli use
@@ -709,6 +716,7 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
       e=$(now_s)
       # gpu_release + docker kill called by EXIT trap above after rc is written
       echo "$rc $((e - s)) $sns $(now_ns)" >"$S2_RESULT"
+      _S2_RESULT_WRITTEN=1
       exit $rc
     ) &
     local PID2=$!
@@ -1025,6 +1033,27 @@ if [[ -n "$BATCH_FILE" ]]; then
   fi
   # write our pid into the lock file so contenders can identify the holder
   echo "$$" >"$_BATCH_LOCK"
+
+  # fc-pool preflight — batch mode only; single-URL mode skips this block.
+  #
+  # transport boundary:
+  #   endpoint: GET ${FC_POOL_URL}/healthz  (systemd unit on localhost:8150)
+  #   timeout:  3s  — fc-pool is local loopback, any delay > 1s is a daemon issue
+  #   on down:  warn + proceed with fallback (stage-0 uses in-container yt-dlp)
+  #   FC_POOL_STRICT=1: exit 1 instead of warning, for CI / supervised batch runs
+  #   note: the fallback path is ~30min per URL vs ~2min via fc-pool — warn loudly
+  if ! curl -sf --max-time 3 "${FC_POOL_URL}/healthz" >/dev/null 2>&1; then
+    echo ""
+    echo "[batch] WARNING: fc-pool is unreachable at ${FC_POOL_URL}/healthz" >&2
+    echo "[batch] WARNING: stage 0 will use in-container yt-dlp — ~30min per URL (vs ~2min via fc-pool)" >&2
+    echo "[batch] WARNING: set FC_POOL_STRICT=1 to abort instead of falling back" >&2
+    echo ""
+    if [[ "${FC_POOL_STRICT:-0}" = "1" ]]; then
+      echo "[batch] FC_POOL_STRICT=1: aborting — start fc-pool (systemd unit on port 8150) before retrying" >&2
+      exit 1
+    fi
+    sleep 3
+  fi
 
   process_batch "$BATCH_FILE" "$PARALLEL_N" "$MODEL"
   exit $?
