@@ -1,151 +1,106 @@
-#!/bin/bash
-# batch.sh — batch orchestration for transcribe-headless.sh
-# sourced by transcribe-headless.sh, not called directly
-# expects: run_pipeline(), now_s(), DATA_DIR, FORCE, NARRATIVES_DIR, STAGE_NAMES
-#
-# gpu semaphore (t-02) — batch parallelism note:
-#   --parallel <N> with N>1 launches multiple run_pipeline() subshells concurrently.
-#   each pipeline's whisper and vision stages independently acquire gpu_lock via
-#   gpu_acquire() before their docker-run calls. this serializes actual GPU use
-#   correctly — only one stage holds gpu_lock at any moment across all parallel
-#   pipelines. however, N>1 does NOT increase GPU throughput; it only pipelines
-#   the non-GPU stages (media-extract, merge, narrative) around the serialized
-#   GPU stages. the comment "parallel>1 queues on gpu lock, not truly parallelizes"
-#   is accurate — treat --parallel as overlap optimization, not GPU parallelism.
+#!/usr/bin/env bash
+# rewrite 2026-04-20 — bash is thin glue, logic lives in fc-pool /transcribe/*
+# manifest iteration, status.json stamping, subshell throttle all owned by
+# hs-transcribe batch handler (fc-pool /transcribe/batch endpoint).
+# this script: arg parsing, env defaults, delegation, optional watch tail.
+set -euo pipefail
 
-process_batch() {
-  local batch_file="$1"
-  local max_parallel="$2"
-  local model="$3"
-  local ts
-  ts=$(date +%Y%m%d_%H%M%S)
-  local manifest="$DATA_DIR/batch-${ts}.json"
-  local tmpdir
-  tmpdir=$(mktemp -d)
+# --- defaults ---
+MANIFEST=""
+MAX_PARALLEL=1
+STAGE="whisper"
+WATCH=false
+EXTRA_ARGS=()
 
-  # read URLs
-  local urls=()
-  while IFS= read -r line; do
-    line="${line%%#*}"
-    line="$(echo "$line" | xargs)"
-    [[ -z "$line" ]] && continue
-    urls+=("$line")
-  done <"$batch_file"
-
-  local total=${#urls[@]}
-  echo "[batch] $total URLs, parallel=$max_parallel"
-
-  if ((total == 0)); then
-    echo "[batch] no URLs found in $batch_file"
-    return 1
-  fi
-
-  mkdir -p "$DATA_DIR"
-  local pids=()
-  local active=0
-
-  for i in "${!urls[@]}"; do
-    local url="${urls[$i]}"
-    local slug
-    slug=$(echo "$url" | sed 's|https\?://||;s|www\.||;s|[^a-zA-Z0-9]|_|g' | sed 's|_\+|_|g;s|^_\|_$||g' | cut -c1-60)
-
-    if ((max_parallel > 1)); then
-      # throttle to max_parallel
-      while ((active >= max_parallel)); do
-        wait -n 2>/dev/null
-        ((active--))
-      done
-      (
-        local start end rc
-        start=$(now_s)
-        mkdir -p "$DATA_DIR/$slug"
-        # pre-stamp pending status before run_pipeline so verdict table distinguishes
-        # never-started URLs from URLs that crashed before the first real stage stamp.
-        # run_pipeline overwrites this on its first update_status call.
-        python3 -c "
-import json, sys
-json.dump({'stage': 'pending', 'status': 'pending', 'url': sys.argv[1]},
-          open(sys.argv[2], 'w'), indent=2)
-" "$url" "$DATA_DIR/$slug/status.json" 2>/dev/null || true
-        run_pipeline "$url" "$model" 2>&1 | tee "$DATA_DIR/$slug/run.log" >"$tmpdir/${i}.log"
-        rc=${PIPESTATUS[0]}
-        end=$(now_s)
-        local status_str="done"
-        [[ $rc -ne 0 ]] && status_str="failed"
-        # find narrative path
-        local narr
-        narr=$(grep -o '\[narrative\] wrote .*' "$tmpdir/${i}.log" 2>/dev/null | sed 's/\[narrative\] wrote //' | tail -1)
-        python3 -c "
-import json
-json.dump({
-    'url': '$url',
-    'slug': '$slug',
-    'status': '$status_str',
-    'elapsed_s': $((end - start)),
-    'narrative_path': '$narr'
-}, open('$tmpdir/${i}.json', 'w'))
-"
-        # shellcheck disable=SC2086  # rc is an integer, no word-splitting risk
-        exit $rc
-      ) &
-      pids+=($!)
-      ((active++))
-    else
-      local start end rc
-      start=$(now_s)
-      mkdir -p "$DATA_DIR/$slug"
-      # pre-stamp pending status before run_pipeline (mirrors parallel path above)
-      python3 -c "
-import json, sys
-json.dump({'stage': 'pending', 'status': 'pending', 'url': sys.argv[1]},
-          open(sys.argv[2], 'w'), indent=2)
-" "$url" "$DATA_DIR/$slug/status.json" 2>/dev/null || true
-      run_pipeline "$url" "$model" 2>&1 | tee "$DATA_DIR/$slug/run.log" "$tmpdir/${i}.log" >/dev/null
-      rc=${PIPESTATUS[0]}
-      end=$(now_s)
-      local status_str="done"
-      [[ $rc -ne 0 ]] && status_str="failed"
-      local narr
-      narr=$(grep -o '\[narrative\] wrote .*' "$tmpdir/${i}.log" 2>/dev/null | sed 's/\[narrative\] wrote //' | tail -1)
-      python3 -c "
-import json
-json.dump({
-    'url': '$url',
-    'slug': '$slug',
-    'status': '$status_str',
-    'elapsed_s': $((end - start)),
-    'narrative_path': '$narr'
-}, open('$tmpdir/${i}.json', 'w'))
-"
-    fi
-  done
-
-  # wait for all parallel jobs
-  for pid in "${pids[@]}"; do
-    wait "$pid" 2>/dev/null
-  done
-
-  # build manifest + summary
-  python3 - "$tmpdir" "$manifest" "$total" <<'PYEOF'
-import sys, json, glob, os
-tmpdir, manifest_path, total = sys.argv[1], sys.argv[2], int(sys.argv[3])
-results = []
-for i in range(total):
-    p = os.path.join(tmpdir, f"{i}.json")
-    if os.path.exists(p):
-        results.append(json.loads(open(p).read()))
-    else:
-        results.append({"url": "unknown", "slug": "", "status": "failed", "elapsed_s": 0, "narrative_path": ""})
-with open(manifest_path, "w") as f:
-    json.dump(results, f, indent=2)
-print(f"\n{'url':60s} | {'status':6s} | time")
-print("-" * 80)
-for r in results:
-    u = r["url"][:58]
-    print(f"  {u:58s} | {r['status']:6s} | {r['elapsed_s']}s")
-PYEOF
-
-  echo ""
-  echo "[batch] manifest: $manifest"
-  rm -rf "$tmpdir"
+# --- arg parse ---
+usage() {
+  cat >&2 <<EOF
+usage: batch.sh --manifest <path> [--max-parallel <n>] [--stage <str>] [--watch]
+EOF
+  exit 1
 }
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --manifest)
+      MANIFEST="$2"
+      shift 2
+      ;;
+    --max-parallel)
+      MAX_PARALLEL="$2"
+      shift 2
+      ;;
+    --stage)
+      STAGE="$2"
+      shift 2
+      ;;
+    --watch)
+      WATCH=true
+      shift
+      ;;
+    --help | -h)
+      usage
+      ;;
+    *)
+      # pass unknown flags through to hs-transcribe (e.g. --force, --dry-run)
+      EXTRA_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$MANIFEST" ]]; then
+  echo "[batch] error: --manifest is required" >&2
+  usage
+fi
+
+if [[ ! -f "$MANIFEST" ]]; then
+  echo "[batch] error: manifest not found: $MANIFEST" >&2
+  exit 1
+fi
+
+# --- env ---
+FC_POOL_URL="${FC_POOL_URL:-http://localhost:8150}"
+HS_TRANSCRIBE="${HS_TRANSCRIBE:-hs-transcribe}"
+
+# --- fc-pool reachability preflight ---
+# transport boundary:
+#   endpoint: GET ${FC_POOL_URL}/healthz
+#   timeout:  5s — fc-pool is loopback; any delay beyond 1s indicates daemon issue
+#   on unreachable: exit 1; batch runs are supervised and should not silently degrade
+if ! curl -sf --max-time 5 "${FC_POOL_URL}/healthz" >/dev/null 2>&1; then
+  echo "[batch] error: fc-pool unreachable at ${FC_POOL_URL}/healthz" >&2
+  echo "[batch] start fc-pool (systemd unit on port 8150) then retry" >&2
+  exit 1
+fi
+
+# --- delegate to hs-transcribe batch ---
+# hs-transcribe owns: manifest iteration, status.json stamping, wait-n throttle,
+# gpu_lock serialization across parallel slots, retry classification, jaeger traces.
+# --watch: if set, poll hs-transcribe status <job-id> --watch after batch submit
+#          and tail its output to tty.
+echo "[batch] dispatching to ${HS_TRANSCRIBE} batch" >&2
+
+if [[ "$WATCH" == true ]]; then
+  # extract job_id from --json response (hs-transcribe has no --print-job-id flag)
+  JOB_ID=$(
+    "$HS_TRANSCRIBE" --json batch \
+      --manifest "$MANIFEST" \
+      --max-parallel "$MAX_PARALLEL" \
+      --stage "$STAGE" \
+      "${EXTRA_ARGS[@]}" |
+      jq -r '.job_id'
+  )
+  if [[ -z "$JOB_ID" || "$JOB_ID" == "null" ]]; then
+    echo "[batch] failed to parse job_id from hs-transcribe batch response" >&2
+    exit 2
+  fi
+  echo "[batch] job-id: ${JOB_ID}" >&2
+  exec "$HS_TRANSCRIBE" status "$JOB_ID" --watch
+else
+  exec "$HS_TRANSCRIBE" batch \
+    --manifest "$MANIFEST" \
+    --max-parallel "$MAX_PARALLEL" \
+    --stage "$STAGE" \
+    "${EXTRA_ARGS[@]}"
+fi
