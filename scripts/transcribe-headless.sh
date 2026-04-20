@@ -692,6 +692,7 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
         echo "[pipeline] error: could not acquire gpu_lock for vision stage" >&2
         sns=$(now_ns)
         echo "1 0 $sns $(now_ns)" >"$S2_RESULT"
+        _S2_RESULT_WRITTEN=1
         exit 1
       fi
       # free GPU memory held by any ollama models kept warm from prior narrative/cli use
@@ -1032,6 +1033,27 @@ if [[ -n "$BATCH_FILE" ]]; then
   fi
   # write our pid into the lock file so contenders can identify the holder
   echo "$$" >"$_BATCH_LOCK"
+
+  # fc-pool preflight — batch mode only; single-URL mode skips this block.
+  #
+  # transport boundary:
+  #   endpoint: GET ${FC_POOL_URL}/healthz  (systemd unit on localhost:8150)
+  #   timeout:  3s  — fc-pool is local loopback, any delay > 1s is a daemon issue
+  #   on down:  warn + proceed with fallback (stage-0 uses in-container yt-dlp)
+  #   FC_POOL_STRICT=1: exit 1 instead of warning, for CI / supervised batch runs
+  #   note: the fallback path is ~30min per URL vs ~2min via fc-pool — warn loudly
+  if ! curl -sf --max-time 3 "${FC_POOL_URL}/healthz" >/dev/null 2>&1; then
+    echo ""
+    echo "[batch] WARNING: fc-pool is unreachable at ${FC_POOL_URL}/healthz" >&2
+    echo "[batch] WARNING: stage 0 will use in-container yt-dlp — ~30min per URL (vs ~2min via fc-pool)" >&2
+    echo "[batch] WARNING: set FC_POOL_STRICT=1 to abort instead of falling back" >&2
+    echo ""
+    if [[ "${FC_POOL_STRICT:-0}" = "1" ]]; then
+      echo "[batch] FC_POOL_STRICT=1: aborting — start fc-pool (systemd unit on port 8150) before retrying" >&2
+      exit 1
+    fi
+    sleep 3
+  fi
 
   process_batch "$BATCH_FILE" "$PARALLEL_N" "$MODEL"
   exit $?
