@@ -66,6 +66,16 @@ TIMEOUT_STAGE4="${TIMEOUT_STAGE4:-180}"
 
 STAGE_NAMES=("media-extract" "whisper" "vision" "merge" "narrative")
 
+# container writes land on host bind mounts — run as host uid:gid so files are
+# owned by $USER:heraldstack instead of root. heraldstack group is shared across
+# human + container identities. override via DOCKER_USER_ARGS if needed.
+_HS_GID=$(getent group heraldstack 2>/dev/null | cut -d: -f3)
+if [[ -n "$_HS_GID" ]]; then
+  DOCKER_USER_ARGS="${DOCKER_USER_ARGS:---user $(id -u):${_HS_GID} --group-add ${_HS_GID}}"
+else
+  DOCKER_USER_ARGS="${DOCKER_USER_ARGS:-}"
+fi
+
 # --- helpers ---
 
 now_s() { date +%s; }
@@ -100,6 +110,36 @@ send_trace() {
   python3 "$TRACE_PY" send "$JAEGER_OTLP" "$TRACE_ID" \
     "$(python3 "$TRACE_PY" id "${span_name}-${SLUG}" 8)" \
     "$span_name" "$start_ns" "$end_ns" "$status" "$PIPELINE_SPAN" "$@" 2>/dev/null &
+}
+
+# --- ollama gpu eviction ---
+#
+# ollama keeps loaded models resident on the GPU for keep_alive seconds after
+# last use (default 300s). on a 12GB AMD GPU this can hold ~7-8GB, leaving
+# the vision container with 0 bytes free even though pytorch only needs ~4GB.
+# observed: HIP OOM with 3.56 GiB allocated / 0 bytes free.
+#
+# fix: before whisper+vision stages, POST keep_alive=0 for every loaded model
+# so ollama unloads them and returns GPU memory to the OS. narrative stage
+# (stage 4) re-loads mistral-nemo / llama3.1:8b on demand — first call after
+# eviction pays a cold-load cost, handled by OLLAMA_TIMEOUT=600 in
+# generate-narrative.py.
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
+
+ollama_evict() {
+  local models
+  models=$(curl -sf --max-time 5 "${OLLAMA_URL}/api/ps" 2>/dev/null |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join(m["name"] for m in d.get("models",[])))' 2>/dev/null)
+  if [[ -z "$models" ]]; then
+    return 0
+  fi
+  while IFS= read -r m; do
+    [[ -z "$m" ]] && continue
+    echo "[ollama-evict] unloading $m"
+    curl -sf --max-time 10 -X POST "${OLLAMA_URL}/api/generate" \
+      -H 'Content-Type: application/json' \
+      -d "{\"model\":\"$m\",\"keep_alive\":0}" >/dev/null 2>&1 || true
+  done <<<"$models"
 }
 
 # --- gpu semaphore (t-02) ---
@@ -152,6 +192,8 @@ gpu_acquire() {
   local attempt=0
   local elapsed=0
 
+  local my_host
+  my_host=$(hostname -s)
   while ((elapsed < max_wait)); do
     local result
     result=$(valkey_cmd SET gpu_lock "$owner" NX EX "$ttl")
@@ -163,10 +205,20 @@ gpu_acquire() {
     fi
     local held_by
     held_by=$(valkey_cmd GET gpu_lock 2>/dev/null || echo "unknown")
+    # self-heal: holder is <pid>-<host>-<stage>. if host matches and pid is dead,
+    # the lock is orphaned — delete and retry immediately. safer than waiting for ttl.
+    local h_pid="${held_by%%-*}"
+    local h_rest="${held_by#*-}"
+    local h_host="${h_rest%%-*}"
+    if [[ "$h_host" == "$my_host" && "$h_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$h_pid" 2>/dev/null; then
+      echo "[gpu-lock] stale lock detected: holder pid $h_pid on $h_host is dead — releasing"
+      valkey_cmd DEL gpu_lock >/dev/null
+      continue
+    fi
     echo "[gpu-lock] lock held by '$held_by' — retry $((attempt + 1)) in ${delay}s (${elapsed}/${max_wait}s elapsed)"
     sleep "$delay"
     elapsed=$((elapsed + delay))
-    delay=$(( delay * 2 > 60 ? 60 : delay * 2 ))
+    delay=$((delay * 2 > 60 ? 60 : delay * 2))
     ((attempt++))
   done
 
@@ -336,7 +388,13 @@ PYEOF
     update_status 0 "media-extract" "running"
 
     BASE=$(date +%Y%m%d_%H%M%S)_$(echo "$SLUG" | cut -c1-40)
-    timeout "$TIMEOUT_STAGE0" docker run --rm \
+    # container name: deterministic per pid+stage so the kill trap can target it
+    _S0A_CNAME="whisper-$$-s0audio"
+    # cleanup contract: kill container on exit — covers timeout path where docker
+    # run client is killed but daemon keeps container running indefinitely.
+    trap 'docker kill "'"$_S0A_CNAME"'" 2>/dev/null; docker rm -f "'"$_S0A_CNAME"'" 2>/dev/null; rm -f "$S1_RESULT" "$S2_RESULT"; gpu_release' EXIT SIGINT SIGTERM
+    # shellcheck disable=SC2086  # DOCKER_USER_ARGS intentionally word-splits into multiple flags
+    timeout "$TIMEOUT_STAGE0" docker run --rm --name "$_S0A_CNAME" $DOCKER_USER_ARGS \
       -v "$VIDEO_DIR/audio:/media/audio" \
       -v "$VIDEO_DIR/videos:/media/videos" \
       -v "$VIDEO_DIR/transcripts:/media/transcripts" \
@@ -416,7 +474,18 @@ except Exception:
         send_trace "stage-0-media-extract" "$S0_START_NS" "$(now_ns)" "error" "stage=0"
         return 1
       fi
-      WHISPER_OUT=$(timeout "$TIMEOUT_STAGE0" docker run --rm \
+      # stage-0 fallback: stdout must be captured into WHISPER_OUT for base-prefix
+      # parsing below, so we cannot use run_with_timeout (nested subshell loses $?).
+      # inline pattern: name the container, write output to tmpfile, kill on EXIT.
+      #
+      # container name: deterministic per pid+stage
+      # cleanup contract: docker kill fires on EXIT (timeout or signal) — daemon
+      # keeps container alive after client kill without this trap.
+      _S0F_CNAME="whisper-$$-s0fallback"
+      _S0F_OUT=$(mktemp)
+      trap 'docker kill "'"$_S0F_CNAME"'" 2>/dev/null; docker rm -f "'"$_S0F_CNAME"'" 2>/dev/null; rm -f "$_S0F_OUT" "$S1_RESULT" "$S2_RESULT"; gpu_release' EXIT SIGINT SIGTERM
+      # shellcheck disable=SC2086  # DOCKER_USER_ARGS intentionally word-splits into multiple flags
+      timeout "$TIMEOUT_STAGE0" docker run --rm --name "$_S0F_CNAME" $DOCKER_USER_ARGS \
         --device=/dev/kfd --device=/dev/dri \
         --group-add video \
         --group-add render \
@@ -427,7 +496,9 @@ except Exception:
         -e HSA_OVERRIDE_GFX_VERSION=10.3.0 \
         -e PYTORCH_ALLOC_CONF=expandable_segments:True \
         -e SCENE_THRESHOLD=0.4 \
-        "$WHISPER_IMAGE" "$URL" "$MODEL" 2>&1)
+        "$WHISPER_IMAGE" "$URL" "$MODEL" >"$_S0F_OUT" 2>&1
+      WHISPER_OUT=$(cat "$_S0F_OUT")
+      rm -f "$_S0F_OUT"
       # release immediately after docker-run completes — stages 1+2 need the lock
       gpu_release
       echo "$WHISPER_OUT"
@@ -544,16 +615,22 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
     echo "[pipeline] stage 1/4: whisper transcription (model=$MODEL)"
     update_status 1 "whisper" "running"
     (
-      # transport boundary: SET gpu_lock <owner> NX EX 1200 before docker-run
-      # cleanup contract: trap releases lock on any exit from this subshell,
-      # including SIGINT/SIGTERM forwarded by the parent's wait builtin
-      trap 'gpu_release' EXIT SIGINT SIGTERM
+      # transport boundary: SET gpu_lock <owner> NX EX 3600 before docker-run
+      # cleanup contract: initial trap releases gpu lock; expanded below to also
+      # kill the named container — set after cname is declared so the string
+      # expansion captures the correct value.
+      # container name: deterministic per pid+stage — docker kill targets this
+      # on timeout so daemon does not keep the container running indefinitely.
+      _S1_CNAME="whisper-$$-s1"
+      trap 'docker kill "'"$_S1_CNAME"'" 2>/dev/null; docker rm -f "'"$_S1_CNAME"'" 2>/dev/null; gpu_release' EXIT SIGINT SIGTERM
       if ! gpu_acquire "whisper" 3600; then
         echo "[pipeline] error: could not acquire gpu_lock for whisper stage" >&2
         sns=$(now_ns)
         echo "1 0 $sns $(now_ns)" >"$S1_RESULT"
         exit 1
       fi
+      # free GPU memory held by any ollama models kept warm from prior narrative/cli use
+      ollama_evict
       s=$(now_s)
       sns=$(now_ns)
       AUDIO_FILE=$(ls -t "${VIDEO_DIR}/audio/${BASE}"*.wav 2>/dev/null | head -1)
@@ -562,7 +639,8 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
         echo "1 0 $sns $(now_ns)" >"$S1_RESULT"
         exit 1
       fi
-      timeout "$TIMEOUT_STAGE1" docker run --rm \
+      # shellcheck disable=SC2086  # DOCKER_USER_ARGS intentionally word-splits into multiple flags
+      timeout "$TIMEOUT_STAGE1" docker run --rm --name "$_S1_CNAME" $DOCKER_USER_ARGS \
         --device=/dev/kfd --device=/dev/dri \
         --group-add video \
         --group-add render \
@@ -580,7 +658,7 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
         2>&1
       rc=$?
       e=$(now_s)
-      # gpu_release called by EXIT trap above after rc is written
+      # gpu_release + docker kill called by EXIT trap above after rc is written
       echo "$rc $((e - s)) $sns $(now_ns)" >"$S1_RESULT"
       exit $rc
     ) &
@@ -596,20 +674,26 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
     echo "[pipeline] stage 2/4: vision (Instella-VL-1B)"
     update_status 2 "vision" "running"
     (
-      # transport boundary: SET gpu_lock <owner> NX EX 1200 before docker-run
+      # transport boundary: SET gpu_lock <owner> NX EX 3600 before docker-run
       # vision acquires after whisper releases — stages are backgrounded in parallel
       # but the lock serializes actual GPU use. whisper PID1 holds the lock first;
       # vision will backoff and retry up to 62s total before failing.
-      trap 'gpu_release' EXIT SIGINT SIGTERM
+      # container name: deterministic per pid+stage — kill trap fires on timeout
+      # so daemon does not keep the container running indefinitely after client kill.
+      _S2_CNAME="whisper-$$-s2"
+      trap 'docker kill "'"$_S2_CNAME"'" 2>/dev/null; docker rm -f "'"$_S2_CNAME"'" 2>/dev/null; gpu_release' EXIT SIGINT SIGTERM
       if ! gpu_acquire "vision" 3600; then
         echo "[pipeline] error: could not acquire gpu_lock for vision stage" >&2
         sns=$(now_ns)
         echo "1 0 $sns $(now_ns)" >"$S2_RESULT"
         exit 1
       fi
+      # free GPU memory held by any ollama models kept warm from prior narrative/cli use
+      ollama_evict
       s=$(now_s)
       sns=$(now_ns)
-      timeout "$TIMEOUT_STAGE2" docker run --rm \
+      # shellcheck disable=SC2086  # DOCKER_USER_ARGS intentionally word-splits into multiple flags
+      timeout "$TIMEOUT_STAGE2" docker run --rm --name "$_S2_CNAME" $DOCKER_USER_ARGS \
         --device=/dev/kfd --device=/dev/dri \
         --group-add video \
         --group-add render \
@@ -623,7 +707,7 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
         2>&1
       rc=$?
       e=$(now_s)
-      # gpu_release called by EXIT trap above after rc is written
+      # gpu_release + docker kill called by EXIT trap above after rc is written
       echo "$rc $((e - s)) $sns $(now_ns)" >"$S2_RESULT"
       exit $rc
     ) &
@@ -719,7 +803,13 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
     S3_START_NS=$(now_ns)
     update_status 3 "merge" "running"
 
-    if ! timeout "$TIMEOUT_STAGE3" docker run --rm \
+    # container name: deterministic per pid+stage
+    # cleanup contract: run_with_timeout installs docker kill trap in its subshell
+    # — container is killed when timeout fires, not just the docker run client.
+    _S3_CNAME="whisper-$$-s3"
+    # shellcheck disable=SC2086  # DOCKER_USER_ARGS intentionally word-splits into multiple flags
+    if ! run_with_timeout "$TIMEOUT_STAGE3" "$_S3_CNAME" \
+      docker run --rm $DOCKER_USER_ARGS \
       -v "$VIDEO_DIR:/media" \
       -v "$PROJECT_DIR/scripts:/scripts" \
       --entrypoint python3 \
@@ -847,6 +937,56 @@ with open(sys.argv[1]) as f:
 # --- batch mode (sourced from batch.sh) ---
 source "$PROJECT_DIR/scripts/batch.sh"
 
+# --- container-kill-on-timeout helper ---
+#
+# transport boundary:
+#   run_with_timeout <timeout_s> <cname> docker run [args...]
+#
+#   assigns --name <cname> to the docker run invocation so the container has a
+#   deterministic identity for the kill path. runs in a subshell so the trap
+#   is scoped to this helper call — does not interfere with the caller's traps.
+#
+#   cleanup contract:
+#     trap 'docker kill <cname> 2>/dev/null; docker rm -f <cname> 2>/dev/null' EXIT
+#     fires on: normal exit (container already gone via --rm), timeout kill,
+#     SIGINT, SIGTERM forwarded from the parent process.
+#     docker kill on an already-exited container is a no-op (exit 1, suppressed).
+#     docker rm -f cleans up if --rm did not fire (timeout path killed the client
+#     before docker daemon processed the --rm flag).
+#
+#   stdout/stderr: passed through to caller via subshell stdout.
+#   return code:   the docker run exit code (or timeout's 124 on expiry).
+#
+#   NOTE: do not use this helper when caller needs stdout captured into a variable
+#   via VARNAME=$(run_with_timeout ...) — the nested subshell eats the outer $?.
+#   for those sites, patch inline (see stage-0 fallback below).
+
+run_with_timeout() {
+  local timeout_s="$1"
+  local cname="$2"
+  shift 2
+  # $@ is now the full docker run invocation (without --name, we inject it)
+  # find the position of "docker" and inject --name immediately after "run"
+  local args=("$@")
+  local patched=()
+  local run_seen=false
+  for arg in "${args[@]}"; do
+    patched+=("$arg")
+    if [[ "$run_seen" = false && "$arg" == "run" ]]; then
+      patched+=("--name" "$cname")
+      run_seen=true
+    fi
+  done
+
+  (
+    # kill the named container on any exit from this subshell — covers both the
+    # normal path (container exited, docker kill is a no-op) and the timeout
+    # path (client process killed, container still running in daemon).
+    trap 'docker kill "'"$cname"'" 2>/dev/null; docker rm -f "'"$cname"'" 2>/dev/null' EXIT
+    timeout "$timeout_s" "${patched[@]}"
+  )
+}
+
 # --- main ---
 
 if [[ -n "$BATCH_FILE" ]]; then
@@ -862,6 +1002,29 @@ if [[ -n "$BATCH_FILE" ]]; then
     done <"$BATCH_FILE"
     exit 0
   fi
+
+  # lockfile on batch manifest path — prevents concurrent invocations against
+  # the same batch file from stacking three pipeline trees on top of each other.
+  #
+  # transport boundary:
+  #   lock path: /tmp/transcribe-<basename-of-BATCH_FILE>.lock
+  #   flock -n:  non-blocking — fails immediately if lock is held
+  #   held by:   the process that owns the flock fd (shell holding exec 9>...)
+  #   release:   automatic on process exit (fd close), no explicit DEL needed
+  #   scope:     batch mode only — single-URL mode does not need serialization
+  #
+  # on contention: print the holding pid and exit non-zero so the caller gets a
+  # clear signal rather than silently stacking work.
+  _BATCH_LOCK="/tmp/transcribe-$(basename "$BATCH_FILE").lock"
+  exec 9>"$_BATCH_LOCK"
+  if ! flock -n 9; then
+    _HOLDING_PID=$(cat "$_BATCH_LOCK" 2>/dev/null || echo "unknown")
+    echo "[batch] error: batch manifest '$BATCH_FILE' is already being processed" >&2
+    echo "[batch] lock held at $_BATCH_LOCK (check pid via: fuser $_BATCH_LOCK)" >&2
+    exit 1
+  fi
+  # write our pid into the lock file so contenders can identify the holder
+  echo "$$" >"$_BATCH_LOCK"
 
   process_batch "$BATCH_FILE" "$PARALLEL_N" "$MODEL"
   exit $?
