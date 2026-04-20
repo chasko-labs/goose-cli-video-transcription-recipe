@@ -6,6 +6,7 @@ accepts any of:
   - youtube/podcast playlist url (any yt-dlp playlist)
   - @channel handle (enumerate recent uploads)
   - file path containing one url per line (# comments + blank lines ok)
+  - .md file — urls extracted via regex from markdown tables, links, and inline text
 
 for each enumerated url:
   - derives the slug using the same rule as transcribe-headless.sh line ~257
@@ -129,7 +130,119 @@ def _ytdlp_flat(url: str) -> list[str]:
     return out
 
 
+_MD_URL_RE = re.compile(r"https?://[^\s|)<>\"\]]+")
+
+# media-url classifier — only these categories get past the md-ingestion filter.
+# order matters: more-specific patterns first (video before channel, etc).
+_YT_VIDEO_RE = re.compile(
+    r"^https?://(?:www\.|m\.)?(?:youtube\.com/(?:watch\?|shorts/|embed/|v/)|youtu\.be/)",
+    re.IGNORECASE,
+)
+_YT_PLAYLIST_RE = re.compile(
+    r"^https?://(?:www\.)?youtube\.com/playlist\?", re.IGNORECASE
+)
+_YT_CHANNEL_RE = re.compile(
+    r"^https?://(?:www\.)?youtube\.com/(?:@[A-Za-z0-9_.-]+|c/|channel/|user/)",
+    re.IGNORECASE,
+)
+_FEED_RE = re.compile(r"^https?://\S+?(?:\.rss(?:\?|$)|/feed/?(?:\?|$))", re.IGNORECASE)
+_PODCAST_HOST_RE = re.compile(
+    r"^https?://(?:podcasts\.apple\.com|open\.spotify\.com|pca\.st|overcast\.fm|castro\.fm)/",
+    re.IGNORECASE,
+)
+
+
+def classify_url(url: str) -> str | None:
+    """return media category (video|playlist|channel|feed|podcast) or None.
+
+    None means the url is not a supported media source — typically docs,
+    blog posts, github, or other non-video links that leak through the
+    generic https?:// regex when scraping markdown.
+    """
+    if _YT_VIDEO_RE.match(url):
+        return "video"
+    if _YT_PLAYLIST_RE.match(url):
+        return "playlist"
+    if _YT_CHANNEL_RE.match(url):
+        return "channel"
+    if _FEED_RE.match(url):
+        return "feed"
+    if _PODCAST_HOST_RE.match(url):
+        return "podcast"
+    return None
+
+
+def _expand_collection(url: str, kind: str) -> list[str]:
+    """expand a channel/playlist/feed into individual video urls via yt-dlp."""
+    target = url
+    if kind == "channel" and "/videos" not in url.rstrip("/").split("?", 1)[0]:
+        target = url.rstrip("/") + "/videos"
+    try:
+        return _ytdlp_flat(target)
+    except SystemExit as exc:
+        sys.stderr.write(f"intake: failed to expand {kind} {url!r}: {exc}\n")
+        return []
+
+
+def _read_md_file(path: Path) -> list[str]:
+    """extract media urls from a markdown file, classify, expand collections.
+
+    non-media urls (docs, blog posts, github) are dropped with a reason
+    logged to stderr. youtube channels and playlists are expanded into their
+    constituent video urls via yt-dlp --flat-playlist so the downstream batch
+    is always a flat list of single videos.
+    """
+    raw_urls = []
+    seen_raw: set[str] = set()
+    for url in _MD_URL_RE.findall(path.read_text()):
+        url = url.rstrip(".,;)")
+        if url in seen_raw:
+            continue
+        seen_raw.add(url)
+        raw_urls.append(url)
+
+    buckets: dict[str, list[str]] = {
+        "video": [], "playlist": [], "channel": [], "feed": [], "podcast": []
+    }
+    dropped: list[str] = []
+    for u in raw_urls:
+        cat = classify_url(u)
+        if cat is None:
+            dropped.append(u)
+        else:
+            buckets[cat].append(u)
+
+    # summary of what we found before expansion
+    summary = "  ".join(f"{k}={len(v)}" for k, v in buckets.items() if v)
+    print(
+        f"intake: md-classified {len(raw_urls)} url(s) — {summary or 'no media urls'}  "
+        f"dropped={len(dropped)}"
+    )
+    if dropped:
+        sys.stderr.write(f"intake: dropped {len(dropped)} non-media url(s) from {path.name}:\n")
+        for u in dropped[:10]:
+            sys.stderr.write(f"  - {u}\n")
+        if len(dropped) > 10:
+            sys.stderr.write(f"  ... and {len(dropped) - 10} more\n")
+
+    out: list[str] = []
+    out.extend(buckets["video"])
+    for kind in ("playlist", "channel", "feed", "podcast"):
+        for u in buckets[kind]:
+            expanded = _expand_collection(u, kind)
+            print(f"intake: md-expanded {kind} {u} -> {len(expanded)} video(s)")
+            out.extend(expanded)
+
+    # dedupe post-expansion, preserve order
+    seen: dict[str, None] = {}
+    for u in out:
+        seen.setdefault(u, None)
+    return list(seen.keys())
+
+
 def _read_url_file(path: Path) -> list[str]:
+    if path.suffix.lower() == ".md":
+        return _read_md_file(path)
     urls: list[str] = []
     for raw in path.read_text().splitlines():
         line = raw.split("#", 1)[0].strip()
@@ -180,13 +293,28 @@ class ManifestRow:
 
 
 def build_manifest(urls: list[str]) -> list[ManifestRow]:
+    """dedupe by url AND slug, then check per-slug status.json.
+
+    url dedup collapses exact duplicates; slug dedup collapses
+    equivalent urls that normalize to the same target (e.g. youtu.be/X
+    and youtube.com/watch?v=X both slug to a different yet overlapping
+    form — first-seen url wins, later ones get skipped-dup-slug).
+    """
     rows: list[ManifestRow] = []
-    seen: set[str] = set()
+    seen_url: set[str] = set()
+    seen_slug: set[str] = set()
     for u in urls:
-        if u in seen:
+        if u in seen_url:
             continue
-        seen.add(u)
+        seen_url.add(u)
         slug = slug_for(u)
+        if slug in seen_slug:
+            rows.append(ManifestRow(
+                url=u, slug=slug, status="skipped-dup-slug",
+                last_error="same slug as earlier url in this batch",
+            ))
+            continue
+        seen_slug.add(slug)
         if is_done(slug):
             rows.append(ManifestRow(url=u, slug=slug, status="skipped-dedup"))
         else:
@@ -290,6 +418,7 @@ def classify_post_run(row: ManifestRow) -> ManifestRow:
 _STATUS_GLYPH = {
     "done": "v",          # 'v' (checkmark-ish ascii) — per house style, no unicode
     "skipped-dedup": "=",
+    "skipped-dup-slug": "~",
     "retryable": "o",
     "failed": "x",
     "pending": "-",
@@ -312,8 +441,8 @@ def print_closing_table(rows: list[ManifestRow]) -> None:
         totals[r.status] = totals.get(r.status, 0) + 1
     print(
         f"total={len(rows)}  done={totals['done']}  retryable={totals['retryable']}  "
-        f"failed={totals['failed']}  skipped={totals['skipped-dedup']}  "
-        f"pending={totals['pending']}"
+        f"failed={totals['failed']}  skipped-dedup={totals['skipped-dedup']}  "
+        f"skipped-dup-slug={totals['skipped-dup-slug']}  pending={totals['pending']}"
     )
 
 
