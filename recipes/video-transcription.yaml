@@ -15,19 +15,16 @@ instructions: |
   # steps
   1. Run the pipeline on rocm-aibox:
      ```
-     ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh '{{ video_url }}' {{ model_size }} {{ extra_flags }}"
+     ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh --url '{{ video_url }}' --stage whisper {{ extra_flags }}"
      ```
-  2. Wait for it to complete. Progress logs:
-     - `[pipeline] stage 0/4: media-extract` — yt-dlp download + ffmpeg audio/frames
-     - `[pipeline] stage 1/4: whisper` — gpu transcription
-     - `[pipeline] stage 2/4: vision` — instella-vl-1b frame analysis (skipped if audio-only)
-     - `[pipeline] tightening transcript` — regex filler removal
-     - `[pipeline] stage 3/4: merge` — timestamp correlation, combined doc
-     - `[pipeline] stage 4/4: narrative` — ollama narrative generation
-     - `[pipeline] tightening narrative` — ollama prose tightening
-  3. Capture the final output lines:
-     - `[pipeline] combined:   ~/video-transcripts/<slug>/transcripts/<base>-combined.md`
-     - `[pipeline] narrative:  ~/video-transcripts/narratives/<content-title>.md`
+     transcribe-headless.sh is thin glue — it validates fc-pool reachability then
+     delegates to `hs-transcribe run`. all stage logic, gpu_lock, docker lifecycle,
+     and status.json writes are owned by fc-pool /transcribe/* endpoints.
+  2. Wait for it to complete. hs-transcribe emits structured json to stdout and
+     progress lines to stderr. key stderr markers:
+     - `[transcribe] dispatching to hs-transcribe` — preflight passed, handed off
+     - stage progress comes from hs-transcribe itself (see fc-pool docs)
+  3. Capture output paths from the json response on stdout (fields: combined_path, narrative_path, slug, base).
   4. Report back with:
      - the per-video slug and base prefix
      - full path to combined.md and the narrative
@@ -35,11 +32,12 @@ instructions: |
      - brief summary of what the content covered (from the narrative)
 
   # batch mode
-  For multiple URLs, create a file with one URL per line and use:
+  For multiple URLs, pass a manifest file (one URL per line) to batch.sh:
   ```
-  ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/transcribe-headless.sh --batch /path/to/urls.txt --parallel 2"
+  ssh rocm-aibox "bash ~/code/projects/goose-cli-video-transcription-recipe/scripts/batch.sh --manifest /path/to/urls.txt --max-parallel 2"
   ```
-  Report the manifest path and summary table.
+  batch.sh delegates to `hs-transcribe batch`. add `--watch` to tail job status.
+  Report the job-id and summary table from hs-transcribe output.
 
   # monitoring
   - poll status: `ssh rocm-aibox "cat ~/video-transcripts/<slug>/status.json"`
@@ -54,16 +52,11 @@ parameters:
     input_type: string
     requirement: required
     description: URL of the video or podcast to transcribe (youtube, direct mp3, any yt-dlp source)
-  - key: model_size
-    input_type: string
-    requirement: optional
-    default: medium
-    description: "whisper model size: tiny | base | small | medium | large"
   - key: extra_flags
     input_type: string
     requirement: optional
     default: ""
-    description: "additional flags: --force --dry-run --audio-only"
+    description: "additional flags passed through to hs-transcribe: --force --dry-run --stage vision"
 
 extensions:
   - type: builtin
@@ -77,6 +70,5 @@ settings:
 
 prompt: |
   Transcribe and analyze this content: {{ video_url }}
-  Whisper model: {{ model_size }}
   Extra flags: {{ extra_flags }}
   Run the full pipeline and report the output paths and a brief summary.
