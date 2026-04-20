@@ -681,7 +681,13 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
       # container name: deterministic per pid+stage — kill trap fires on timeout
       # so daemon does not keep the container running indefinitely after client kill.
       _S2_CNAME="whisper-$$-s2"
-      trap 'docker kill "'"$_S2_CNAME"'" 2>/dev/null; docker rm -f "'"$_S2_CNAME"'" 2>/dev/null; gpu_release' EXIT SIGINT SIGTERM
+      # sentinel flag: set to 1 after the normal result line is written (line ~711).
+      # the trap checks this to avoid overwriting a good result with the fallback line.
+      # format: "rc elapsed_s start_ns end_ns" — four fields, matches parent parse at line ~747.
+      # fallback: "1 0 0 0" (rc=1, zero counters) so parent read -r finds a well-formed line
+      # even when the subshell is SIGTERM'd before the docker run completes.
+      _S2_RESULT_WRITTEN=0
+      trap 'docker kill "'"$_S2_CNAME"'" 2>/dev/null; docker rm -f "'"$_S2_CNAME"'" 2>/dev/null; [[ "$_S2_RESULT_WRITTEN" -eq 0 ]] && echo "1 0 0 0" >'"$S2_RESULT"'; gpu_release' EXIT SIGINT SIGTERM
       if ! gpu_acquire "vision" 3600; then
         echo "[pipeline] error: could not acquire gpu_lock for vision stage" >&2
         sns=$(now_ns)
@@ -709,6 +715,7 @@ with open('$VIDEO_DIR/transcripts/${BASE}-frame-analysis.json', 'w') as f:
       e=$(now_s)
       # gpu_release + docker kill called by EXIT trap above after rc is written
       echo "$rc $((e - s)) $sns $(now_ns)" >"$S2_RESULT"
+      _S2_RESULT_WRITTEN=1
       exit $rc
     ) &
     local PID2=$!
