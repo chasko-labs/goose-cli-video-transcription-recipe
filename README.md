@@ -138,11 +138,11 @@ see [docs/pipeline-gaps-2026-07-12.md](docs/pipeline-gaps-2026-07-12.md) for det
 6. user-match permissions in docker stages
 7. rss feed ingestion (parse feed, batch episodes)
 
-## blog
+## narrative
 
-published transcripts live in [`blog/`](blog/). first entry:
+published transcripts live in [`narrative/`](narrative/). first entry:
 
-- [Yells at Cloud Ep. 01 — Generally Available](blog/2026-07-12-yells-at-cloud-ep1-generally-available.md) (64-min podcast, 5 speakers, transcribed in 4m14s)
+- [Yells at Cloud Ep. 01 — Generally Available](narrative/2026-07-12-yells-at-cloud-ep1-generally-available.md) (64-min podcast, 5 speakers, transcribed in 4m14s)
 
 ## setup
 

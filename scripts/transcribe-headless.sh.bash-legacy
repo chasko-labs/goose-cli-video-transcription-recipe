@@ -943,7 +943,7 @@ with open(sys.argv[1]) as f:
 }
 
 # --- batch mode (sourced from batch.sh) ---
-source "$PROJECT_DIR/scripts/batch.sh"
+source "$PROJECT_DIR/scripts/batch.sh.bash-legacy"
 
 # --- container-kill-on-timeout helper ---
 #

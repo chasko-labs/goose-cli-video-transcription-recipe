@@ -15,10 +15,10 @@ for each enumerated url:
   - writes a manifest sidecar at ~/video-transcripts/.manifests/<date>-<label>.json
     [{url, slug, status, attempts, last_error}, ...]
   - writes a plain-text batch file alongside (one url per line) that is what
-    actually gets handed to transcribe-headless.sh --batch
+    actually gets handed to batch.sh --manifest
 
-then unless --dry-run: dispatches scripts/transcribe-headless.sh --batch <txt>
---parallel N and, on completion, re-reads each per-slug status.json to build a
+then unless --dry-run: dispatches scripts/batch.sh --manifest <txt>
+--max-parallel N and, on completion, re-reads each per-slug status.json to build a
 closing status table plus overwatch next-action hints.
 
 complements #19 transcribe-local (single-url and pre-built batch file paths) —
@@ -43,7 +43,7 @@ from typing import Iterable
 DATA_DIR = Path.home() / "video-transcripts"
 MANIFESTS_DIR = DATA_DIR / ".manifests"
 REPO_DIR = Path(__file__).resolve().parent.parent
-TRANSCRIBE_SCRIPT = REPO_DIR / "scripts" / "transcribe-headless.sh"
+TRANSCRIBE_SCRIPT = REPO_DIR / "scripts" / "batch.sh"
 
 # matches the slug derivation in scripts/transcribe-headless.sh line ~257:
 #   sed 's|https\?://||;s|www\.||;s|[^a-zA-Z0-9]|_|g' | sed 's|_\+|_|g;s|^_\|_$||g' | cut -c1-60
@@ -374,9 +374,9 @@ def dispatch_batch(txt_path: Path, parallel: int) -> tuple[int, str, str]:
     cmd = [
         "bash",
         str(TRANSCRIBE_SCRIPT),
-        "--batch",
+        "--manifest",
         str(txt_path),
-        "--parallel",
+        "--max-parallel",
         str(parallel),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)

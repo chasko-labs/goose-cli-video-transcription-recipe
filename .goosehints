@@ -1,0 +1,47 @@
+# goose-cli-video-transcription-recipe — project hints
+
+## what this is
+
+pipeline repo for video + podcast transcription. scripts run on rocm-aibox against
+~/video-transcripts/ as the data dir. recipes live in recipes/.
+
+## recipes (use /recipe to invoke)
+
+- `intake.yaml` — bulk front door: @handle, playlist url, file of urls, or single url.
+  runs yt-dlp --flat-playlist to enumerate real urls, dedupes against existing
+  status.json, dispatches --parallel 2. use this for any "transcribe all videos from
+  channel/playlist" request. supports --dry-run to enumerate without dispatching.
+- `video-transcription-local.yaml` — single-url pipeline (media-extract → whisper → instella-vl → tighten → narrative)
+- `tidy.yaml` — retention sweep over ~/video-transcripts/
+- `goose-cli-tutor.yaml` — walks a goose-cli principle using qdrant corpus first
+
+## anti-hallucination rule
+
+NEVER enumerate, list, or guess video URLs or titles from memory or training data.
+YouTube URLs change, video IDs are opaque, and any list you produce without running
+yt-dlp will contain fabricated IDs and dates.
+
+when asked to transcribe videos from a channel or playlist:
+1. ask the user to confirm they want --dry-run first or want to dispatch for real
+2. run: `python3 scripts/intake.py '<source>' --dry-run`
+   where <source> is the url or @handle the user gave you
+3. show the enumerated urls from the manifest, confirm with user, then dispatch without --dry-run
+
+never fabricate urls. if you cannot run yt-dlp, say so and ask the user to run it directly.
+
+## correct invocation pattern
+
+```
+# dry-run first (enumerate only, no dispatch)
+python3 ~/code/projects/goose-cli-video-transcription-recipe/scripts/intake.py \
+  '@goose-oss' --dry-run --label goose-oss
+
+# then real run
+python3 ~/code/projects/goose-cli-video-transcription-recipe/scripts/intake.py \
+  '@goose-oss' --parallel 2 --label goose-oss
+```
+
+or via recipe:
+```
+/recipe intake.yaml source=@goose-oss dry_run_flag=--dry-run
+```
