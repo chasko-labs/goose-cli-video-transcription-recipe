@@ -10,7 +10,7 @@ refactored from [kiro-cli-custom-agent-screenpal-video-transcription](https://gi
 mac mini (trigger) -> ssh -> rocm-aibox (processing)
 
 stage 0: media-extract    fc-pool microvm (yt-dlp + ffmpeg) | fallback: whisper container
-stage 1: whisper           gpu — audio transcription (medium model default)
+stage 1: whisper           gpu — audio transcription (large-v3-turbo via serve endpoint, 15x realtime)
 stage 2: vision            gpu — instella-vl-1b frame analysis        } stages 1+2 run in parallel
 stage 3: merge             correlate audio segments + visual frames by timestamp
 stage 4: narrative         ollama llama3.1:8b weaves transcript + visuals into prose
@@ -18,12 +18,12 @@ stage 4: narrative         ollama llama3.1:8b weaves transcript + visuals into p
 
 ## infrastructure
 
-| component | location | purpose |
-|---|---|---|
-| rocm-aibox | 192.168.4.53 | gpu processing, docker, ollama, fc-pool |
-| fc-pool | :8150 | firecracker microvm bridge for cpu-only media extraction |
-| jaeger | :4318 (otlp), :16686 (ui) | distributed tracing — one trace per pipeline run |
-| ollama | :11434 | narrative generation (llama3.1:8b) |
+| component  | location                  | purpose                                                  |
+| ---------- | ------------------------- | -------------------------------------------------------- |
+| rocm-aibox | 192.168.4.53              | gpu processing, docker, ollama, fc-pool                  |
+| fc-pool    | :8150                     | firecracker microvm bridge for cpu-only media extraction |
+| jaeger     | :4318 (otlp), :16686 (ui) | distributed tracing — one trace per pipeline run         |
+| ollama     | :11434                    | narrative generation (llama3.1:8b)                       |
 
 ## goose-session wiring
 
@@ -83,21 +83,21 @@ NARRATIVE_MODEL=...  ollama model override (default: llama3.1:8b)
 
 ## scripts
 
-| file | purpose |
-|---|---|
+| file                           | purpose                                                                  |
+| ------------------------------ | ------------------------------------------------------------------------ |
 | scripts/transcribe-headless.sh | main orchestrator — arg parsing, stage dispatch, timing, tracing, resume |
-| scripts/batch.sh | batch mode orchestration (sourced by main script) |
-| scripts/trace.py | otlp http json span sender for jaeger (stdlib only) |
-| scripts/tighten.py | filler removal (regex) + narrative prose tightening (ollama) |
-| scripts/merge-outputs.py | stage 3 — correlate whisper segments + vision frames by timestamp |
-| scripts/generate-narrative.py | stage 4 — build llm prompt, call ollama, write narrative md |
+| scripts/batch.sh               | batch mode orchestration (sourced by main script)                        |
+| scripts/trace.py               | otlp http json span sender for jaeger (stdlib only)                      |
+| scripts/tighten.py             | filler removal (regex) + narrative prose tightening (ollama)             |
+| scripts/merge-outputs.py       | stage 3 — correlate whisper segments + vision frames by timestamp        |
+| scripts/generate-narrative.py  | stage 4 — build llm prompt, call ollama, write narrative md              |
 
 ## docker images
 
-| image | gpu | purpose |
-|---|---|---|
+| image                                        | gpu  | purpose                          |
+| -------------------------------------------- | ---- | -------------------------------- |
 | goose-cli-video-transcription-recipe-whisper | rocm | openai-whisper + yt-dlp + ffmpeg |
-| goose-cli-video-transcription-recipe-vision | rocm | transformers + instella-vl-1b |
+| goose-cli-video-transcription-recipe-vision  | rocm | transformers + instella-vl-1b    |
 
 built automatically on first run if missing
 
@@ -127,6 +127,10 @@ for podcasts and direct audio urls:
 ## setup
 
 see [docs/setup-guide.md](docs/setup-guide.md) — step-by-step build order from single-stage whisper test to full pipeline with fc-pool. each step is independently testable. includes known constraints, design decisions, and gpu memory considerations
+
+## whisper model
+
+see [docs/whisper-model.md](docs/whisper-model.md) — model selection (large-v3-turbo primary, medium fallback), serve endpoint API, performance benchmarks (4m14s for 64-min video = 15x realtime), VRAM budget, and fallback behavior
 
 ## lineage
 
