@@ -1,10 +1,21 @@
 #!/usr/bin/env python3
 """
 route-narrative.py — vectorize a tightened narrative into qdrant gander-knowledge
+(or an s3vectors index when ROUTE_BACKEND=s3vectors / --backend s3vectors).
 
 usage:
-  route-narrative.py <narrative-md-path> <video-dir>
+  route-narrative.py <narrative-md-path> <video-dir> [--backend qdrant|s3vectors]
   route-narrative.py --help
+
+backends:
+  qdrant    (default) local qdrant gander-knowledge via fastembed MiniLM-384
+  s3vectors amazon s3vectors index via bedrock titan-embed-1024.
+            env: S3V_BUCKET (default typescript-course),
+                 S3V_INDEX (default video-narratives),
+                 S3V_REGION (default us-east-1),
+                 S3V_EMBED_MODEL (default amazon.titan-embed-text-v2:0).
+            boto3 resolves credentials from the standard chain
+            (AWS_PROFILE honored).
 
 reads:
   <narrative-md-path>            — the tightened narrative markdown
@@ -71,6 +82,13 @@ COLLECTION = os.environ.get("GANDER_KNOWLEDGE_COLLECTION", "gander-knowledge")
 VECTOR_NAME = "fast-all-minilm-l6-v2"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
+_BACKEND = os.environ.get("ROUTE_BACKEND", "qdrant").strip().lower()
+S3V_BUCKET = os.environ.get("S3V_BUCKET", "typescript-course")
+S3V_INDEX = os.environ.get("S3V_INDEX", "video-narratives")
+S3V_REGION = os.environ.get("S3V_REGION", "us-east-1")
+S3V_EMBED_MODEL = os.environ.get("S3V_EMBED_MODEL", "amazon.titan-embed-text-v2:0")
+S3V_PUT_BATCH = 50
+
 # chunking: target 2000-4000 chars (~500-1000 tokens @ 4 chars/token)
 CHUNK_MIN = 2000
 CHUNK_MAX = 4000
@@ -83,13 +101,14 @@ def log(msg: str) -> None:
     print(f"[route-narrative] {msg}", file=sys.stderr, flush=True)
 
 
-def emit_structured_log(event: str, slug: str, chunk_count: int, qdrant_status: str, ms: int, error: str | None = None) -> None:
+def emit_structured_log(event: str, slug: str, chunk_count: int, status: str, ms: int, error: str | None = None, backend: str = "qdrant") -> None:
     """emit one-line jsonl structured log to stdout for downstream aggregation."""
     record = {
         "event": event,
         "slug": slug,
         "chunk_count": chunk_count,
-        "qdrant_status": qdrant_status,
+        "backend": backend,
+        "qdrant_status" if backend == "qdrant" else "s3vectors_status": status,
         "ms": ms,
     }
     if error:
@@ -189,10 +208,15 @@ def read_metadata(meta_path: Path | None) -> dict:
         return {}
 
 
-def chunk_narrative(body: str) -> list[str]:
+S3V_CHUNK_MIN = 600
+S3V_CHUNK_MAX = 1200  # keeps s3vectors filterable metadata under its 2048-byte cap
+
+
+def chunk_narrative(body: str, chunk_min: int = CHUNK_MIN, chunk_max: int = CHUNK_MAX) -> list[str]:
     """split by h2/h3, then paragraph-split oversized chunks.
 
     narratives here rarely have headings — fallback is paragraph groups.
+    s3vectors callers pass the smaller S3V_* bounds (metadata size cap).
     """
     # first try heading split
     sections: list[str] = []
@@ -217,7 +241,7 @@ def chunk_narrative(body: str) -> list[str]:
     for s in sections:
         if not s.strip():
             continue
-        if len(s) > CHUNK_MAX:
+        if len(s) > chunk_max:
             # flush buffer
             if buf:
                 chunks.append(buf.strip())
@@ -226,25 +250,25 @@ def chunk_narrative(body: str) -> list[str]:
             paragraphs = [p.strip() for p in re.split(r"\n\s*\n", s) if p.strip()]
             sub = ""
             for para in paragraphs:
-                if len(para) > CHUNK_MAX:
+                if len(para) > chunk_max:
                     # sentence split
                     sentences = re.split(r"(?<=[.!?])\s+", para)
                     for sent in sentences:
-                        if len(sub) + len(sent) + 1 > CHUNK_MAX and sub:
+                        if len(sub) + len(sent) + 1 > chunk_max and sub:
                             chunks.append(sub.strip())
                             sub = ""
                         sub += (" " if sub else "") + sent
                 else:
-                    if len(sub) + len(para) + 2 > CHUNK_MAX and sub:
+                    if len(sub) + len(para) + 2 > chunk_max and sub:
                         chunks.append(sub.strip())
                         sub = ""
                     sub += ("\n\n" if sub else "") + para
             if sub:
                 chunks.append(sub.strip())
             continue
-        if len(buf) + len(s) + 2 <= CHUNK_MAX:
+        if len(buf) + len(s) + 2 <= chunk_max:
             buf += ("\n\n" if buf else "") + s
-            if len(buf) >= CHUNK_MIN:
+            if len(buf) >= chunk_min:
                 chunks.append(buf.strip())
                 buf = ""
         else:
@@ -301,6 +325,158 @@ def upsert_points(points: list[dict]) -> dict:
         f"/collections/{COLLECTION}/points?wait=true",
         {"points": points},
     )
+
+
+def video_id_from_narrative_path(path: Path) -> str:
+    """video id = filename stem minus the '-narrative' suffix, case preserved."""
+    stem = path.stem
+    if stem.endswith("-narrative"):
+        stem = stem[: -len("-narrative")]
+    return stem
+
+
+def s3v_clients():
+    """boto3 clients for the s3vectors backend. import here so --help and
+    the qdrant path work without boto3 installed."""
+    import boto3
+    from botocore.config import Config
+
+    cfg = Config(
+        retries={"total_max_attempts": 5, "mode": "adaptive"},
+        connect_timeout=10,
+        read_timeout=120,
+    )
+    bedrock = boto3.client("bedrock-runtime", region_name=S3V_REGION, config=cfg)
+    s3v = boto3.client("s3vectors", region_name=S3V_REGION, config=cfg)
+    return bedrock, s3v
+
+
+def embed_texts_titan(bedrock, texts: list[str]) -> list[list[float]]:
+    """embed via bedrock titan (one inputText per call)."""
+    vecs: list[list[float]] = []
+    for t in texts:
+        resp = bedrock.invoke_model(
+            modelId=S3V_EMBED_MODEL,
+            body=json.dumps({"inputText": t}).encode("utf-8"),
+        )
+        payload = json.loads(resp["body"].read().decode("utf-8"))
+        vecs.append([float(x) for x in payload["embedding"]])
+    return vecs
+
+
+def s3v_existing_keys(s3v, video_id: str) -> list[str]:
+    """keys previously written for this video.
+
+    list_vectors has no server-side prefix/filter, so scan keys (cheap,
+    no data/metadata) and match the video prefix client-side.
+    """
+    paginator = s3v.get_paginator("list_vectors")
+    want = f"{video_id}-"
+    keys: list[str] = []
+    for page in paginator.paginate(
+        vectorBucketName=S3V_BUCKET,
+        indexName=S3V_INDEX,
+        returnData=False,
+        returnMetadata=False,
+    ):
+        keys.extend(v["key"] for v in page.get("vectors", []) if v["key"].startswith(want))
+    return keys
+
+
+def s3v_put_records(s3v, records: list[dict]) -> None:
+    for i in range(0, len(records), S3V_PUT_BATCH):
+        s3v.put_vectors(
+            vectorBucketName=S3V_BUCKET,
+            indexName=S3V_INDEX,
+            vectors=records[i : i + S3V_PUT_BATCH],
+        )
+
+
+def route_narrative_s3v(narrative_path: Path, video_dir: Path) -> dict:
+    start_ms = int(time.time() * 1000)
+    md = narrative_path.read_text()
+    meta, body = read_frontmatter(md)
+
+    slug = slug_from_narrative_path(narrative_path)
+    video_id = video_id_from_narrative_path(narrative_path)
+
+    meta_json = read_metadata(find_metadata_json(video_dir))
+    status_json = read_status(find_status_json(video_dir))
+
+    source = detect_source(meta_json)
+    try:
+        duration_s = int(meta_json.get("duration") or 0)
+    except (TypeError, ValueError):
+        duration_s = 0
+    whisper_model = (
+        status_json.get("whisper_model")
+        or os.environ.get("WHISPER_MODEL")
+        or "unknown"
+    )
+    date_transcribed = (
+        status_json.get("started_at")
+        or status_json.get("date_transcribed")
+        or datetime.now(timezone.utc).isoformat()
+    )
+
+    chunks = chunk_narrative(body, S3V_CHUNK_MIN, S3V_CHUNK_MAX)
+    # hard cap per chunk: a single over-long sentence can exceed the chunker
+    # bound; cap before embedding so vectors match stored text (2048B metadata cap)
+    chunks = [c[:S3V_CHUNK_MAX] for c in chunks]
+    if not chunks:
+        log(f"skip: no chunks produced for {narrative_path.name}")
+        ms = int(time.time() * 1000) - start_ms
+        emit_structured_log("route_narrative", slug, 0, "ok", ms, backend="s3vectors")
+        incr_valkey_counter("gander:route:success")
+        return {"slug": slug, "chunks": 0, "skipped": True}
+
+    log(f"s3vectors slug={slug} video={video_id} chunks={len(chunks)} source={source}")
+
+    try:
+        bedrock, s3v = s3v_clients()
+        vectors = embed_texts_titan(bedrock, chunks)
+
+        records = []
+        for i, (text, vec) in enumerate(zip(chunks, vectors)):
+            records.append({
+                "key": f"{video_id}-{i:03d}",
+                "data": {"float32": vec},
+                "metadata": {
+                    "slug": slug,
+                    "video_id": video_id,
+                    "chunk_index": i,
+                    "chunk_count": len(chunks),
+                    "title": meta.get("title", "")[:300],
+                    "source": source,
+                    "date_transcribed": str(date_transcribed),
+                    "duration_s": duration_s,
+                    "whisper_model": str(whisper_model),
+                    "text": text,
+                },
+            })
+
+        # idempotency: put fresh (same keys overwrite), then delete stale keys
+        s3v_put_records(s3v, records)
+        keep = {r["key"] for r in records}
+        stale = [k for k in s3v_existing_keys(s3v, video_id) if k not in keep]
+        if stale:
+            s3v.delete_vectors(
+                vectorBucketName=S3V_BUCKET,
+                indexName=S3V_INDEX,
+                keys=stale,
+            )
+            log(f"s3vectors pruned {len(stale)} stale keys for {video_id}")
+
+        ms = int(time.time() * 1000) - start_ms
+        emit_structured_log("route_narrative", slug, len(chunks), "ok", ms, backend="s3vectors")
+        incr_valkey_counter("gander:route:success")
+        return {"slug": slug, "chunks": len(chunks), "skipped": False}
+    except Exception as e:
+        ms = int(time.time() * 1000) - start_ms
+        error_msg = f"{type(e).__name__}: {str(e)[:100]}"
+        emit_structured_log("route_narrative", slug, len(chunks), "fail", ms, error_msg, backend="s3vectors")
+        incr_valkey_counter("gander:route:fail")
+        raise
 
 
 def route_narrative(narrative_path: Path, video_dir: Path) -> dict:
@@ -371,10 +547,17 @@ def route_narrative(narrative_path: Path, video_dir: Path) -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="route narrative to qdrant gander-knowledge")
+    ap = argparse.ArgumentParser(description="route narrative to qdrant gander-knowledge (or s3vectors)")
     ap.add_argument("narrative", type=Path, help="path to tightened narrative .md")
     ap.add_argument("video_dir", type=Path, help="per-video directory with status.json + transcripts/metadata.json")
+    ap.add_argument("--backend", choices=["qdrant", "s3vectors"], default=None,
+                    help="vector backend (default: $ROUTE_BACKEND or qdrant)")
     args = ap.parse_args()
+
+    backend = (args.backend or _BACKEND or "qdrant").strip().lower()
+    if backend not in ("qdrant", "s3vectors"):
+        log(f"error: unknown backend: {backend}")
+        return 2
 
     if not args.narrative.is_file():
         log(f"error: narrative not found: {args.narrative}")
@@ -384,7 +567,10 @@ def main() -> int:
         return 2
 
     try:
-        result = route_narrative(args.narrative, args.video_dir)
+        if backend == "s3vectors":
+            result = route_narrative_s3v(args.narrative, args.video_dir)
+        else:
+            result = route_narrative(args.narrative, args.video_dir)
     except Exception as e:
         log(f"error: {e}")
         # still return 0 to preserve non-fatal posture in pipeline hook
